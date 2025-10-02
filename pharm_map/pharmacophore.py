@@ -11,7 +11,55 @@ from rdkit.Chem.Draw.MolDrawing import DrawingOptions
 import os
 import itertools
 import copy
+import pickle
 DrawingOptions.includeAtomNumbers=True
+
+class PharmMapper:
+    ff_path = os.path.join(RDConfig.RDDataDir,'BaseFeatures.fdef')
+    ff=ChemicalFeatures.BuildFeatureFactory(ff_path)
+
+    def __init__(self,mols,feature_factory=None):
+        self.mols=mols
+        if feature_factory:
+            self.ff = feature_factory
+
+    @staticmethod
+    def generate_LE_conformers(mols,embed_count=100,random_seed=-1,save=False,filename=None):
+        out_mols = []
+        for mol in mols:
+            confs = AllChem.EmbedMultipleConfs(mol,numConfs=embed_count,
+                                               randomSeed=random_seed)
+            res=AllChem.MMFFOptimizeMoleculeConfs(mol)
+            LE_conf_ID = res.index(min(res,key=lambda t: t[1]))
+            out_mol = Chem.Mol(mol,confId=LE_conf_ID)
+            out_mols.append(out_mol)
+        if save:
+            if filename:
+                save_file = filename
+            else:
+                save_file = "LE_conformers.pkl"
+            with open(save_file,"wb") as file:
+                pickle.dump(out_mols,file)
+        return out_mols
+
+    def prepare_conformers(self):
+        pass
+
+    def read_ph4(self,ph4_file):
+        pass
+
+    def compute_consensus_ph4(self):
+        pass
+
+    def score_mols(self):
+        pass
+
+
+
+
+    
+
+    
 
 def ph4_from_MOE(moe):
     '''
