@@ -50,9 +50,84 @@ class PharmMapper:
 
     def compute_consensus_ph4(self):
         pass
-
-    def score_mols(self):
-        pass
+    
+    @staticmethod
+    def get_pharmacophore_alignment(query,ref,verbose=False):
+        '''
+        Align two pharmacophores using Kabsch algorithm
+        Args:
+        query: rdPharm3D object to be aligned
+        ref: rdPharm3D object to align against
+            ref should contain only essential ph4 features
+        verbose: whether to print diagnostic messages
+        Returns:
+        opt_feat_ids: list of indices for features in query that best
+            match ref
+        opt_mat: transform matrix to rotate query to optimally align to ref
+        opt_rssd: root sum squared distance between query and ref, after
+            alignment
+        results: pd.DataFrame with all feature combinations, transform
+            matrices, and rssd values'''
+        # extract features from rdPharm3D objects
+        ref_feats = ref.getFeatures()
+        ref_df = pd.DataFrame({'family':[f.GetFamily() for f in ref_feats],
+                            'x':[list(f.GetPos())[0] for f in ref_feats],
+                            'y':[list(f.GetPos())[1] for f in ref_feats],
+                            'z':[list(f.GetPos())[2] for f in ref_feats]})
+        query_feats = query.getFeatures()
+        query_df = pd.DataFrame({'family':[f.GetFamily() for f in query_feats],
+                            'x':[list(f.GetPos())[0] for f in query_feats],
+                            'y':[list(f.GetPos())[1] for f in query_feats],
+                            'z':[list(f.GetPos())[2] for f in query_feats]})
+        
+        # get possible combinations of query features that match reference
+        match_found = [False]*len(ref_df)
+        matches = [None]*len(ref_df)
+        for i in range(len(ref_df)):
+            fam = ref_df['family'].iloc[i]
+            fmatch = list(query_df.index[query_df['family']==fam])
+            if len(fmatch)>0:
+                matches[i]=fmatch
+                match_found[i]=True
+        if sum(match_found)<len(ref_df) and verbose:
+            print("Warning: Not all reference features have possible matches in query")
+        # remove unmatched features from reference
+        # (they won't be useful for upcoming calculations)
+        ref_matched = ref_df.iloc[match_found]
+        ref_pos = ref_matched[['x','y','z']].to_numpy()
+        
+        # center reference features (subtract centroid from position)
+        ref_centroid = np.mean(ref_pos,axis=0)
+        ref_pos = ref_pos-ref_centroid
+        
+        # test all combinations of query feature matches
+        summary_feats = []
+        summary_mats = []
+        summary_rssd = []
+        matches = [m for m in matches if m is not None]
+        print(*matches)
+        for q in list(itertools.product(*matches)):
+            # skip any combinations that double-count a feature
+            if len(np.unique(q))<len(q):
+                continue
+            # get position matrix and center (subtract centroid)
+            pos = query_df[['x','y','z']].iloc[list(q)]
+            centroid = np.mean(pos,axis=0)
+            pos = pos-centroid
+            # compute optimal rotation
+            rot, rssd = R.align_vectors(ref_pos,pos)
+            rmat = rot.as_matrix()
+            summary_feats.append(list(q))
+            summary_mats.append(rmat)
+            summary_rssd.append(rssd)
+        results = pd.DataFrame({'Feature IDs':summary_feats,
+                                'Rotation Matrix':summary_mats,
+                                'RSSD':summary_rssd})
+        # get optimal feature combination and corresponding transform/rssd
+        opt_id = results['RSSD'].idxmin()
+        opt_feat_ids,opt_mat,opt_rssd = results.loc[opt_id].tolist()
+        
+        return opt_feat_ids,opt_mat,opt_rssd,results
 
 
 
