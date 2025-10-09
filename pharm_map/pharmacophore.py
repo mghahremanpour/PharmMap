@@ -12,7 +12,25 @@ import os
 import itertools
 import copy
 import pickle
+import sklearn as skl
+import umap
 DrawingOptions.includeAtomNumbers=True
+
+def optimal_kmeans(data,max_k=10,random_state=None):
+    min_silhouette = -1
+    silhouettes = []
+    best_k=2
+    for k in range(2,max_k):
+        clusterer = skl.cluster.KMeans(n_clusters=k,random_state=random_state)
+        clust_labels = clusterer.fit_predict(data)
+        silhouette_avg = skl.metrics.silhouette_score(data,clust_labels)
+        silhouettes.append(silhouette_avg)
+        if silhouette_avg>min_silhouette:
+            best_k = k
+            min_silhouette = silhouette_avg
+    opt_clusterer = skl.cluster.KMeans(n_clusters=best_k,random_state=random_state)
+    opt_clusts = opt_clusterer.fit_predict(data)
+    return opt_clusts, best_k, min_silhouette, silhouettes
 
 class PharmMapper:
     ff_path = os.path.join(RDConfig.RDDataDir,'BaseFeatures.fdef')
@@ -50,6 +68,75 @@ class PharmMapper:
 
     def compute_consensus_ph4(self):
         pass
+    
+    @staticmethod
+    def align_conformers(mols,ref_mol=None):
+        '''
+        Canonicalize all conformers of input molecules and align them
+        Args:
+        mols: list-like of rdMol objects
+        Returns:
+        '''
+        if ref_mol==None:
+            ref_mol = mols[0]
+        ref_params = AllChem.MMFFGetMoleculeProperties(ref_mol)
+        RMSDs = []
+        scores = []
+        for m in mols:
+            rdMolTransforms.CanonicalizeMol(m)
+            mmff_params=AllChem.MMFFGetMoleculeProperties(m)
+            mol_scores={}
+            mol_RMSDs = {}
+            aligners = rdMolAlign.GetO3AForProbeConfs(m,ref_mol,1,mmff_params,ref_params)
+            for i in range(len(aligners)):
+                rmsd = aligners[i].Align()
+                conf = m.GetConformers()[i]
+                cid=conf.GetId()
+                conf_score = aligners[i].Score()
+                mol_scores[cid]=conf_score
+                mol_RMSDs[cid]=rmsd
+            scores.append(mol_scores)
+            RMSDs.append(mol_RMSDs)
+        return RMSDs,scores
+    
+    @staticmethod
+    def cluster_by_fingerprint(mols,fp_method='RDKit',all_confs=False,
+                           clust_method='k_means',max_k=10,random_state=None):
+        if fp_method == 'RDKit':
+            fpgen = AllChem.GetRDKitFPGenerator()
+        elif fp_method == 'atom_pair':
+            fpgen = AllChem.GetAtomPairGenerator()
+        elif fp_method == 'torsion':
+            fpgen = Allchem.GetTopologicalTorsionGenerator()
+        elif fp_method == 'morgan':
+            fpgen = AllChem.GetMorganGenerator()
+        else:
+            print("Unsupported fingerprint generation method. Please use RDKit, atom_pair, torsion, or morgan")
+            return None
+        fps = [fpgen.GetFingerprint(m) for m in mols]
+        fp_array = np.asarray(fps)
+        
+        # dimensionality reduction
+        reducer = umap.UMAP(metric='jaccard',random_state=random_state)
+        umap_fit = reducer.fit_transform(fp_array)
+        
+        # clustering
+        if clust_method == 'k_means':
+            clusts, best_k, min_silhouette, silhouettes = optimal_kmeans(umap_fit,max_k=max_k,
+                                                                        random_state=random_state)
+            clust_qc = (best_k,min_silhouette,silhouettes)
+        
+        # make dict of molecules by cluster
+        clust_dict={}
+        largest_size=0
+        largest_clust = -1
+        for c in list(set(clusts)):
+            clust_mols = [mols[i] for i in range(len(mols)) if clusts[i]==c]
+            clust_dict[int(c)] = clust_mols
+            if len(clust_mols)>largest_size:
+                largest_size=len(clust_mols)
+                largest_clust = int(c)
+        return clust_dict,umap_fit,clusts,largest_clust,clust_qc
     
     @staticmethod
     def get_pharmacophore_alignment(query,ref,verbose=False):
@@ -98,30 +185,38 @@ class PharmMapper:
         
         # center reference features (subtract centroid from position)
         ref_centroid = np.mean(ref_pos,axis=0)
-        ref_pos = ref_pos-ref_centroid
+    #     ref_pos = ref_pos-ref_centroid
         
         # test all combinations of query feature matches
         summary_feats = []
         summary_mats = []
         summary_rssd = []
         matches = [m for m in matches if m is not None]
-        print(*matches)
         for q in list(itertools.product(*matches)):
             # skip any combinations that double-count a feature
             if len(np.unique(q))<len(q):
                 continue
-            # get position matrix and center (subtract centroid)
-            pos = query_df[['x','y','z']].iloc[list(q)]
+            # get transform matrix; try both unchanged and reflected probe configurations
+            pos = query_df[['x','y','z']].iloc[list(q)].to_numpy()
             centroid = np.mean(pos,axis=0)
-            pos = pos-centroid
-            # compute optimal rotation
-            rot, rssd = R.align_vectors(ref_pos,pos)
-            rmat = rot.as_matrix()
+            pos = pos-centroid+ref_centroid
+            SSD, mat = rdAlignment.GetAlignmentTransform(ref_pos,pos)
+            SSD_reflect, mat_reflect = rdAlignment.GetAlignmentTransform(ref_pos,pos,reflect=True)
             summary_feats.append(list(q))
-            summary_mats.append(rmat)
-            summary_rssd.append(rssd)
+            if SSD_reflect<SSD:
+                summary_mats.append(mat_reflect)
+                summary_rssd.append(SSD_reflect)
+            else:
+                summary_mats.append(mat)
+                summary_rssd.append(SSD)
+            # compute optimal rotation
+    #         rot, rssd = R.align_vectors(ref_pos,pos)
+    #         rmat = rot.as_matrix()
+    #         summary_feats.append(list(q))
+    #         summary_mats.append(rmat)
+    #         summary_rssd.append(rssd)
         results = pd.DataFrame({'Feature IDs':summary_feats,
-                                'Rotation Matrix':summary_mats,
+                                'Transform Matrix':summary_mats,
                                 'RSSD':summary_rssd})
         # get optimal feature combination and corresponding transform/rssd
         opt_id = results['RSSD'].idxmin()
