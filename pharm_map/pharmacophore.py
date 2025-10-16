@@ -16,11 +16,11 @@ import sklearn as skl
 import umap
 DrawingOptions.includeAtomNumbers=True
 
-def optimal_kmeans(data,max_k=10,random_state=None):
+def optimal_kmeans(data,min_k=2,max_k=10,random_state=None):
     min_silhouette = -1
     silhouettes = []
-    best_k=2
-    for k in range(2,max_k):
+    best_k=min_k
+    for k in range(min_k,max_k):
         clusterer = skl.cluster.KMeans(n_clusters=k,random_state=random_state)
         clust_labels = clusterer.fit_predict(data)
         silhouette_avg = skl.metrics.silhouette_score(data,clust_labels)
@@ -32,203 +32,333 @@ def optimal_kmeans(data,max_k=10,random_state=None):
     opt_clusts = opt_clusterer.fit_predict(data)
     return opt_clusts, best_k, min_silhouette, silhouettes
 
+def optimal_hierarchical_clustering(data,min_nclust,max_nclust):
+    min_silhouette = -1
+    silhouettes = []
+    best_n=min_nclust
+    for n in range(min_nclust,max_nclust):
+        clusterer = skl.cluster.AgglomerativeClustering(n_clusters=n)
+        clust_labels = clusterer.fit_predict(data)
+        silhouette_avg = skl.metrics.silhouette_score(data,clust_labels)
+        silhouettes.append(silhouette_avg)
+        if silhouette_avg>min_silhouette:
+            best_n = n
+            min_silhouette = silhouette_avg
+    opt_clusterer = skl.cluster.AgglomerativeClustering(n_clusters=best_n)
+    opt_clusts = opt_clusterer.fit_predict(data)
+    return opt_clusts, best_n, min_silhouette, silhouettes
+
+def generate_LE_conformers(mols,embed_count=100,random_seed=-1,save=False,filename=None):
+    out_mols = []
+    for mol in mols:
+        confs = AllChem.EmbedMultipleConfs(mol,numConfs=embed_count,
+                                            randomSeed=random_seed)
+        res=AllChem.MMFFOptimizeMoleculeConfs(mol)
+        LE_conf_ID = res.index(min(res,key=lambda t: t[1]))
+        out_mol = Chem.Mol(mol,confId=LE_conf_ID)
+        out_mols.append(out_mol)
+    if save:
+        if filename:
+            save_file = filename
+        else:
+            save_file = "LE_conformers.pkl"
+        with open(save_file,"wb") as file:
+            pickle.dump(out_mols,file)
+    return out_mols
+                
+def get_representative_conformers(mol,thresh=1.5,make_mols=False):
+    '''
+    Generate set of representative conformers from an input molecule
+    Args:
+    mol: molecule (with conformers already generated) to make conf set from
+    '''
+    dist_matrix = AllChem.GetConformerRMSMatrix(mol)
+    cids = [c.GetId() for c in mol.GetConformers()]
+    clusts = Butina.ClusterData(dist_matrix,len(cids),distThresh=thresh,isDistData=True,reordering=True)
+    centroids = [x[0] for x in clusts]
+    centroid_cids = [cids[i] for i in centroids]
+    if make_mols:
+        new_mols=[]
+        for c in centroid_cids:
+            nm = Chem.Mol(mol,confId=c)
+            new_mols.append(nm)
+    else:
+        new_mols=None
+    return clusts, centroid_cids, new_mols
+
+def extract_features(mols,feature_factory=None):
+    if feature_factory == None:
+        feature_path = os.path.join(RDConfig.RDDataDir, 'BaseFeatures.fdef')
+        feature_factory = ChemicalFeatures.BuildFeatureFactory(feature_path)
+    families = []
+    xs = []
+    ys = []
+    zs = []
+    for m in mols:
+        feats = feature_factory.GetFeaturesForMol(m)
+        for f in feats:
+            if f.GetFamily() != "LumpedHydrophobe": # temporary kludge to work around RDKit's bad feature definitions here
+                families.append(f.GetFamily())
+                xs.append(f.GetPos().x)
+                ys.append(f.GetPos().y)
+                zs.append(f.GetPos().z)
+    feat_df = pd.DataFrame({"Family":families,'x':xs,'y':ys,'z':zs})
+    return feat_df
+
+def align_conformers(mols,ref_mol=None):
+    '''
+    Canonicalize all conformers of input molecules and align them
+    Args:
+    mols: iterable of rdMol objects
+    Returns:
+    '''
+    if ref_mol==None:
+        ref_mol = mols[0]
+    ref_params = AllChem.MMFFGetMoleculeProperties(ref_mol)
+    RMSDs = []
+    scores = []
+    for m in mols:
+        rdMolTransforms.CanonicalizeMol(m)
+        mmff_params=AllChem.MMFFGetMoleculeProperties(m)
+        mol_scores={}
+        mol_RMSDs = {}
+        aligners = rdMolAlign.GetO3AForProbeConfs(m,ref_mol,1,mmff_params,ref_params)
+        for i in range(len(aligners)):
+            rmsd = aligners[i].Align()
+            conf = m.GetConformers()[i]
+            cid=conf.GetId()
+            conf_score = aligners[i].Score()
+            mol_scores[cid]=conf_score
+            mol_RMSDs[cid]=rmsd
+        scores.append(mol_scores)
+        RMSDs.append(mol_RMSDs)
+    return RMSDs,scores
+
+def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=None):
+    clustered_feats = []
+    clust_qc = {}
+    feats_by_fam = feats.groupby('Family')
+    for fam, group in feats_by_fam:
+        pos_matrix = group[['x','y','z']].to_numpy()
+        if clust_method == 'hierarchical':
+            opt_clusts, best_n, min_silhouette, silhouettes = optimal_hierarchical_clustering(pos_matrix,
+                                                                                              min_nclust=2,
+                                                                                              max_nclust=max_n)
+        elif clust_method=='k_means':
+            opt_clusts,best_n,min_silhouette,silhouettes = optimal_kmeans(pos_matrix, min_k=2, max_k=max_n,
+                                                                          random_state=random_state)
+        group['Cluster'] = opt_clusts
+        if len(clustered_feats)==0:
+            clustered_feats = [group]
+        else:
+            clustered_feats.append(group)
+        clust_qc[fam] = (best_n,min_silhouette,silhouettes)
+    clustered_feats = pd.concat(clustered_feats).reset_index(drop=True)
+    return clustered_feats, clust_qc
+
+def compute_feature_centroid_sigma(feats):
+    consensus_feats = []
+    feats_by_fam = feats.groupby('Family')
+    for fam, group in feats_by_fam:
+        clusts = group.groupby('Cluster')
+        for clust, g in clusts:
+            n_feats = len(g)
+            if n_feats > 1:
+                pos_matrix = g[['x','y','z']].to_numpy()
+                centroid = np.average(pos_matrix,axis=0)
+                cov = np.cov(pos_matrix.T)
+                sigma = np.average(np.diag(cov))
+            else:
+                centroid = g[['x','y','z']].to_numpy()
+                sigma = 1.0265
+            consensus_clust = pd.DataFrame({'Family':[fam],'x':[centroid[0]],'y':[centroid[1]],
+                                            'z':[centroid[2]],'sigma':[sigma],'n_feats':[n_feats]})
+            consensus_feats.append(consensus_clust)
+    consensus_feats = pd.concat(consensus_feats).reset_index(drop=True)
+    return consensus_feats
+
+def cluster_by_fingerprint(mols,fp_method='RDKit',all_confs=False,
+                        clust_method='k_means',max_k=10,random_state=None):
+    if fp_method == 'RDKit':
+        fpgen = AllChem.GetRDKitFPGenerator()
+    elif fp_method == 'atom_pair':
+        fpgen = AllChem.GetAtomPairGenerator()
+    elif fp_method == 'torsion':
+        fpgen = AllChem.GetTopologicalTorsionGenerator()
+    elif fp_method == 'morgan':
+        fpgen = AllChem.GetMorganGenerator()
+    else:
+        print("Unsupported fingerprint generation method. Please use RDKit, atom_pair, torsion, or morgan")
+        return None
+    fps = [fpgen.GetFingerprint(m) for m in mols]
+    fp_array = np.asarray(fps)
+    
+    # dimensionality reduction
+    reducer = umap.UMAP(metric='jaccard',random_state=random_state)
+    umap_fit = reducer.fit_transform(fp_array)
+    
+    # clustering
+    if clust_method == 'k_means':
+        clusts, best_k, min_silhouette, silhouettes = optimal_kmeans(umap_fit,max_k=max_k,
+                                                                    random_state=random_state)
+        clust_qc = (best_k,min_silhouette,silhouettes)
+    
+    # make dict of molecules by cluster
+    clust_dict={}
+    largest_size=0
+    largest_clust = -1
+    for c in list(set(clusts)):
+        clust_mols = [mols[i] for i in range(len(mols)) if clusts[i]==c]
+        clust_dict[int(c)] = clust_mols
+        if len(clust_mols)>largest_size:
+            largest_size=len(clust_mols)
+            largest_clust = int(c)
+    return clust_dict,umap_fit,clusts,largest_clust,clust_qc
+
+def get_pharmacophore_alignment(query,ref,verbose=False):
+    '''
+    Align two pharmacophores using Kabsch algorithm
+    Args:
+    query: rdPharm3D object to be aligned
+    ref: rdPharm3D object to align against
+        ref should contain only essential ph4 features
+    verbose: whether to print diagnostic messages
+    Returns:
+    opt_feat_ids: list of indices for features in query that best
+        match ref
+    opt_mat: transform matrix to rotate query to optimally align to ref
+    opt_rssd: root sum squared distance between query and ref, after
+        alignment
+    results: pd.DataFrame with all feature combinations, transform
+        matrices, and rssd values'''
+    # extract features from rdPharm3D objects
+    ref_feats = ref.getFeatures()
+    ref_df = pd.DataFrame({'family':[f.GetFamily() for f in ref_feats],
+                        'x':[list(f.GetPos())[0] for f in ref_feats],
+                        'y':[list(f.GetPos())[1] for f in ref_feats],
+                        'z':[list(f.GetPos())[2] for f in ref_feats]})
+    query_feats = query.getFeatures()
+    query_df = pd.DataFrame({'family':[f.GetFamily() for f in query_feats],
+                        'x':[list(f.GetPos())[0] for f in query_feats],
+                        'y':[list(f.GetPos())[1] for f in query_feats],
+                        'z':[list(f.GetPos())[2] for f in query_feats]})
+    
+    # get possible combinations of query features that match reference
+    match_found = [False]*len(ref_df)
+    matches = [None]*len(ref_df)
+    for i in range(len(ref_df)):
+        fam = ref_df['family'].iloc[i]
+        fmatch = list(query_df.index[query_df['family']==fam])
+        if len(fmatch)>0:
+            matches[i]=fmatch
+            match_found[i]=True
+    if sum(match_found)<len(ref_df) and verbose:
+        print("Warning: Not all reference features have possible matches in query")
+    # remove unmatched features from reference
+    # (they won't be useful for upcoming calculations)
+    ref_matched = ref_df.iloc[match_found]
+    ref_pos = ref_matched[['x','y','z']].to_numpy()
+    
+    # center reference features (subtract centroid from position)
+    ref_centroid = np.mean(ref_pos,axis=0)
+#     ref_pos = ref_pos-ref_centroid
+    
+    # test all combinations of query feature matches
+    summary_feats = []
+    summary_mats = []
+    summary_rssd = []
+    matches = [m for m in matches if m is not None]
+    for q in list(itertools.product(*matches)):
+        # skip any combinations that double-count a feature
+        if len(np.unique(q))<len(q):
+            continue
+        # get transform matrix; try both unchanged and reflected probe configurations
+        pos = query_df[['x','y','z']].iloc[list(q)].to_numpy()
+        centroid = np.mean(pos,axis=0)
+        pos = pos-centroid+ref_centroid
+        SSD, mat = rdAlignment.GetAlignmentTransform(ref_pos,pos)
+        SSD_reflect, mat_reflect = rdAlignment.GetAlignmentTransform(ref_pos,pos,reflect=True)
+        summary_feats.append(list(q))
+        if SSD_reflect<SSD:
+            summary_mats.append(mat_reflect)
+            summary_rssd.append(SSD_reflect)
+        else:
+            summary_mats.append(mat)
+            summary_rssd.append(SSD)
+        # compute optimal rotation
+#         rot, rssd = R.align_vectors(ref_pos,pos)
+#         rmat = rot.as_matrix()
+#         summary_feats.append(list(q))
+#         summary_mats.append(rmat)
+#         summary_rssd.append(rssd)
+    results = pd.DataFrame({'Feature IDs':summary_feats,
+                            'Transform Matrix':summary_mats,
+                            'RSSD':summary_rssd})
+    # get optimal feature combination and corresponding transform/rssd
+    opt_id = results['RSSD'].idxmin()
+    opt_feat_ids,opt_mat,opt_rssd = results.loc[opt_id].tolist()
+    
+    return opt_feat_ids,opt_mat,opt_rssd,results
+
 class PharmMapper:
     ff_path = os.path.join(RDConfig.RDDataDir,'BaseFeatures.fdef')
     ff=ChemicalFeatures.BuildFeatureFactory(ff_path)
+    hits=[]
+    decoys=[]
 
-    def __init__(self,mols,feature_factory=None):
+    def __init__(self,mols,feature_factory=None,potency_key='IC50'):
         self.mols=mols
         if feature_factory:
             self.ff = feature_factory
-
-    @staticmethod
-    def generate_LE_conformers(mols,embed_count=100,random_seed=-1,save=False,filename=None):
-        out_mols = []
-        for mol in mols:
-            confs = AllChem.EmbedMultipleConfs(mol,numConfs=embed_count,
-                                               randomSeed=random_seed)
-            res=AllChem.MMFFOptimizeMoleculeConfs(mol)
-            LE_conf_ID = res.index(min(res,key=lambda t: t[1]))
-            out_mol = Chem.Mol(mol,confId=LE_conf_ID)
-            out_mols.append(out_mol)
-        if save:
-            if filename:
-                save_file = filename
+        self.potkey = potency_key
+    
+    def __unpack_conformers(self,rep_only=True,dist_thresh=1.5):
+        new_mols=[]
+        for m in self.mols:
+            if len(m.GetConformers())>1:
+                if rep_only:
+                    _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
+                                                                    make_mols=True)
+                    new_mols = new_mols + mols_to_use
+                else:
+                    for c in m.GetConformers():
+                        nm=Chem.Mol(m,confId=c.GetId())
+                        new_mols.append(nm)
             else:
-                save_file = "LE_conformers.pkl"
-            with open(save_file,"wb") as file:
-                pickle.dump(out_mols,file)
-        return out_mols
+                new_mols.append(m)
+        return new_mols
 
-    def prepare_conformers(self):
-        pass
+    def __split_actives_inactives(self,thresh=0.1):
+        for m in self.training_mols():
+            if m.GetDoubleProp<=thresh:
+                self.hits.append(m)
+            else:
+                self.decoys.append(m)
+
+    def prepare_training_set(self,dist_thresh=1.5,potency_thresh=0.1):
+            self.training_mols = self.__unpack_conformers(rep_only=True,dist_thresh=dist_thresh)
+            RMSDs,scores = align_conformers(self.training_mols)
+            self.__split_actives_inactives(thresh=potency_thresh)
+
+
+    def generate_training_features(self,clust_method='hierarchical',max_n=10,random_state=None):
+        allhits = extract_features(self.hits,self.ff)
+        alldecoys = extract_features(self.decoys,self.ff)
+        hit_clusts,_ = cluster_features(allhits,clust_method=clust_method,
+                                        max_n=max_n,random_state=random_state)
+        self.consensus_hits = compute_feature_centroid_sigma(hit_clusts)
+        decoy_clusts,_ = cluster_features(alldecoys,clust_method=clust_method,
+                                          max_n=max_n,random_state=random_state)
+        self.consensus_decoys = compute_feature_centroid_sigma(decoy_clusts)
+
+    def train(self,dist_thresh=1.5,potency_thresh=0.1,clust_method='hierarchical',max_n=10,random_state=None):
+        self.prepare_training_set(dist_thresh=dist_thresh,potency_thresh=potency_thresh)
+        self.generate_training_features(self,clust_method=clust_method,max_n=max_n,random_state=random_state)
 
     def read_ph4(self,ph4_file):
         pass
 
-    def compute_consensus_ph4(self):
-        pass
-    
-    @staticmethod
-    def align_conformers(mols,ref_mol=None):
-        '''
-        Canonicalize all conformers of input molecules and align them
-        Args:
-        mols: list-like of rdMol objects
-        Returns:
-        '''
-        if ref_mol==None:
-            ref_mol = mols[0]
-        ref_params = AllChem.MMFFGetMoleculeProperties(ref_mol)
-        RMSDs = []
-        scores = []
-        for m in mols:
-            rdMolTransforms.CanonicalizeMol(m)
-            mmff_params=AllChem.MMFFGetMoleculeProperties(m)
-            mol_scores={}
-            mol_RMSDs = {}
-            aligners = rdMolAlign.GetO3AForProbeConfs(m,ref_mol,1,mmff_params,ref_params)
-            for i in range(len(aligners)):
-                rmsd = aligners[i].Align()
-                conf = m.GetConformers()[i]
-                cid=conf.GetId()
-                conf_score = aligners[i].Score()
-                mol_scores[cid]=conf_score
-                mol_RMSDs[cid]=rmsd
-            scores.append(mol_scores)
-            RMSDs.append(mol_RMSDs)
-        return RMSDs,scores
-    
-    @staticmethod
-    def cluster_by_fingerprint(mols,fp_method='RDKit',all_confs=False,
-                           clust_method='k_means',max_k=10,random_state=None):
-        if fp_method == 'RDKit':
-            fpgen = AllChem.GetRDKitFPGenerator()
-        elif fp_method == 'atom_pair':
-            fpgen = AllChem.GetAtomPairGenerator()
-        elif fp_method == 'torsion':
-            fpgen = Allchem.GetTopologicalTorsionGenerator()
-        elif fp_method == 'morgan':
-            fpgen = AllChem.GetMorganGenerator()
-        else:
-            print("Unsupported fingerprint generation method. Please use RDKit, atom_pair, torsion, or morgan")
-            return None
-        fps = [fpgen.GetFingerprint(m) for m in mols]
-        fp_array = np.asarray(fps)
-        
-        # dimensionality reduction
-        reducer = umap.UMAP(metric='jaccard',random_state=random_state)
-        umap_fit = reducer.fit_transform(fp_array)
-        
-        # clustering
-        if clust_method == 'k_means':
-            clusts, best_k, min_silhouette, silhouettes = optimal_kmeans(umap_fit,max_k=max_k,
-                                                                        random_state=random_state)
-            clust_qc = (best_k,min_silhouette,silhouettes)
-        
-        # make dict of molecules by cluster
-        clust_dict={}
-        largest_size=0
-        largest_clust = -1
-        for c in list(set(clusts)):
-            clust_mols = [mols[i] for i in range(len(mols)) if clusts[i]==c]
-            clust_dict[int(c)] = clust_mols
-            if len(clust_mols)>largest_size:
-                largest_size=len(clust_mols)
-                largest_clust = int(c)
-        return clust_dict,umap_fit,clusts,largest_clust,clust_qc
-    
-    @staticmethod
-    def get_pharmacophore_alignment(query,ref,verbose=False):
-        '''
-        Align two pharmacophores using Kabsch algorithm
-        Args:
-        query: rdPharm3D object to be aligned
-        ref: rdPharm3D object to align against
-            ref should contain only essential ph4 features
-        verbose: whether to print diagnostic messages
-        Returns:
-        opt_feat_ids: list of indices for features in query that best
-            match ref
-        opt_mat: transform matrix to rotate query to optimally align to ref
-        opt_rssd: root sum squared distance between query and ref, after
-            alignment
-        results: pd.DataFrame with all feature combinations, transform
-            matrices, and rssd values'''
-        # extract features from rdPharm3D objects
-        ref_feats = ref.getFeatures()
-        ref_df = pd.DataFrame({'family':[f.GetFamily() for f in ref_feats],
-                            'x':[list(f.GetPos())[0] for f in ref_feats],
-                            'y':[list(f.GetPos())[1] for f in ref_feats],
-                            'z':[list(f.GetPos())[2] for f in ref_feats]})
-        query_feats = query.getFeatures()
-        query_df = pd.DataFrame({'family':[f.GetFamily() for f in query_feats],
-                            'x':[list(f.GetPos())[0] for f in query_feats],
-                            'y':[list(f.GetPos())[1] for f in query_feats],
-                            'z':[list(f.GetPos())[2] for f in query_feats]})
-        
-        # get possible combinations of query features that match reference
-        match_found = [False]*len(ref_df)
-        matches = [None]*len(ref_df)
-        for i in range(len(ref_df)):
-            fam = ref_df['family'].iloc[i]
-            fmatch = list(query_df.index[query_df['family']==fam])
-            if len(fmatch)>0:
-                matches[i]=fmatch
-                match_found[i]=True
-        if sum(match_found)<len(ref_df) and verbose:
-            print("Warning: Not all reference features have possible matches in query")
-        # remove unmatched features from reference
-        # (they won't be useful for upcoming calculations)
-        ref_matched = ref_df.iloc[match_found]
-        ref_pos = ref_matched[['x','y','z']].to_numpy()
-        
-        # center reference features (subtract centroid from position)
-        ref_centroid = np.mean(ref_pos,axis=0)
-    #     ref_pos = ref_pos-ref_centroid
-        
-        # test all combinations of query feature matches
-        summary_feats = []
-        summary_mats = []
-        summary_rssd = []
-        matches = [m for m in matches if m is not None]
-        for q in list(itertools.product(*matches)):
-            # skip any combinations that double-count a feature
-            if len(np.unique(q))<len(q):
-                continue
-            # get transform matrix; try both unchanged and reflected probe configurations
-            pos = query_df[['x','y','z']].iloc[list(q)].to_numpy()
-            centroid = np.mean(pos,axis=0)
-            pos = pos-centroid+ref_centroid
-            SSD, mat = rdAlignment.GetAlignmentTransform(ref_pos,pos)
-            SSD_reflect, mat_reflect = rdAlignment.GetAlignmentTransform(ref_pos,pos,reflect=True)
-            summary_feats.append(list(q))
-            if SSD_reflect<SSD:
-                summary_mats.append(mat_reflect)
-                summary_rssd.append(SSD_reflect)
-            else:
-                summary_mats.append(mat)
-                summary_rssd.append(SSD)
-            # compute optimal rotation
-    #         rot, rssd = R.align_vectors(ref_pos,pos)
-    #         rmat = rot.as_matrix()
-    #         summary_feats.append(list(q))
-    #         summary_mats.append(rmat)
-    #         summary_rssd.append(rssd)
-        results = pd.DataFrame({'Feature IDs':summary_feats,
-                                'Transform Matrix':summary_mats,
-                                'RSSD':summary_rssd})
-        # get optimal feature combination and corresponding transform/rssd
-        opt_id = results['RSSD'].idxmin()
-        opt_feat_ids,opt_mat,opt_rssd = results.loc[opt_id].tolist()
-        
-        return opt_feat_ids,opt_mat,opt_rssd,results
-
-
-
-
-    
-
+### Things below this point are likely not useful
     
 
 def ph4_from_MOE(moe):
