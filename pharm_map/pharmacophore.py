@@ -3,50 +3,83 @@ import rdkit
 import pandas as pd
 import matplotlib.pyplot as plt
 from rdkit import Chem, RDConfig, Geometry, RDLogger
-from rdkit.Chem import AllChem, ChemicalFeatures, rdDistGeom, rdMolTransforms, rdShapeAlign, FeatMaps, Draw
+from rdkit.Chem import AllChem, ChemicalFeatures, rdDistGeom, rdMolTransforms, rdShapeAlign, Draw, rdChemicalFeatures, rdMolAlign
 from rdkit.Chem.Pharm3D import Pharmacophore, EmbedLib
 from rdkit.Numerics import rdAlignment
 from rdkit.Chem.Draw import IPythonConsole, MolDrawing
 from rdkit.Chem.Draw.MolDrawing import DrawingOptions
+from rdkit.Chem.FeatMaps import FeatMapUtils, FeatMaps
+from rdkit.ML.Cluster import Butina
 import os
 import itertools
 import copy
+import random
+import scipy
+from scipy.spatial.transform import Rotation as R
+import py3Dmol
 import pickle
 import sklearn as skl
 import umap
 DrawingOptions.includeAtomNumbers=True
 
 def optimal_kmeans(data,min_k=2,max_k=10,random_state=None):
-    min_silhouette = -1
+    '''
+    Determines optimal k for k-means clustering and performs clustering at optimal value
+    Args:
+    data: matrix of data to cluster
+    min_k, max_k: min and max values of k to sweep over
+    random_state: seed for randomization
+    Returns:
+    opt_clusts: cluster assignments for optimal value of k
+    best_k: k value that maximizes silhouette score
+    max_silhouette: silhouette score of optimal k
+    silhouettes: list of silhouette scores for each k value attempted
+    '''
+    max_silhouette = -1
     silhouettes = []
     best_k=min_k
+    # iterate over all ks and find maximum silhouette score
     for k in range(min_k,max_k):
         clusterer = skl.cluster.KMeans(n_clusters=k,random_state=random_state)
         clust_labels = clusterer.fit_predict(data)
         silhouette_avg = skl.metrics.silhouette_score(data,clust_labels)
         silhouettes.append(silhouette_avg)
-        if silhouette_avg>min_silhouette:
+        if silhouette_avg>max_silhouette:
             best_k = k
-            min_silhouette = silhouette_avg
+            max_silhouette = silhouette_avg
+    # run optimal clustering
     opt_clusterer = skl.cluster.KMeans(n_clusters=best_k,random_state=random_state)
     opt_clusts = opt_clusterer.fit_predict(data)
-    return opt_clusts, best_k, min_silhouette, silhouettes
+    return opt_clusts, best_k, max_silhouette, silhouettes
 
 def optimal_hierarchical_clustering(data,min_nclust,max_nclust):
-    min_silhouette = -1
+    '''
+    Determines optimal n for hierarchical clustering and performs clustering at optimal value
+    Args:
+    data: matrix of data to cluster
+    min_nclust, max_nclust: min and max values of n to sweep over
+    Returns:
+    opt_clusts: cluster assignments for optimal value of n
+    best_n: number of clusters that maximizes silhouette score
+    max_silhouette: silhouette score of optimal n
+    silhouettes: list of silhouette scores for each n value attempted
+    '''
+    max_silhouette = -1
     silhouettes = []
     best_n=min_nclust
+    # iterate over all n and find maximum silhouette score
     for n in range(min_nclust,max_nclust):
         clusterer = skl.cluster.AgglomerativeClustering(n_clusters=n)
         clust_labels = clusterer.fit_predict(data)
         silhouette_avg = skl.metrics.silhouette_score(data,clust_labels)
         silhouettes.append(silhouette_avg)
-        if silhouette_avg>min_silhouette:
+        if silhouette_avg>max_silhouette:
             best_n = n
-            min_silhouette = silhouette_avg
+            max_silhouette = silhouette_avg
+    # run optimal clustering
     opt_clusterer = skl.cluster.AgglomerativeClustering(n_clusters=best_n)
     opt_clusts = opt_clusterer.fit_predict(data)
-    return opt_clusts, best_n, min_silhouette, silhouettes
+    return opt_clusts, best_n, max_silhouette, silhouettes
 
 def generate_LE_conformers(mols,embed_count=100,random_seed=-1,save=False,filename=None):
     out_mols = []
@@ -71,13 +104,19 @@ def get_representative_conformers(mol,thresh=1.5,make_mols=False):
     Generate set of representative conformers from an input molecule
     Args:
     mol: molecule (with conformers already generated) to make conf set from
+    thresh: distance threshold [Angstroms] beyond which conformers are not considered neighbors
+    make_mols: whether or not to return new rdMol objects
+    Returns:
+    new_mols: list of rdMol objects with one conformer each if make_mols==True, or None if make_mols==False
     '''
+    # align conformers and get RMSDs
     dist_matrix = AllChem.GetConformerRMSMatrix(mol)
     cids = [c.GetId() for c in mol.GetConformers()]
+    # cluster conformers and extract centroids; cluster centroids are representative conformers
     clusts = Butina.ClusterData(dist_matrix,len(cids),distThresh=thresh,isDistData=True,reordering=True)
     centroids = [x[0] for x in clusts]
     centroid_cids = [cids[i] for i in centroids]
-    if make_mols:
+    if make_mols: # make new single-conformer rdMol objects if desired
         new_mols=[]
         for c in centroid_cids:
             nm = Chem.Mol(mol,confId=c)
@@ -87,6 +126,16 @@ def get_representative_conformers(mol,thresh=1.5,make_mols=False):
     return clusts, centroid_cids, new_mols
 
 def extract_features(mols,feature_factory=None):
+    '''
+    Extract pharmacophoric features from a set of molecules
+    Args:
+    mols: list of rdMol objects to get features from
+    feature_factory: rdkit feature factory built from definitions of features of interest.
+        will use rdkit default if None provided
+    Returns:
+    feat_df: pd.DataFrame containing feature families and x,y,z positions
+    '''
+    # get rdkit default feature factory if none was provided
     if feature_factory == None:
         feature_path = os.path.join(RDConfig.RDDataDir, 'BaseFeatures.fdef')
         feature_factory = ChemicalFeatures.BuildFeatureFactory(feature_path)
@@ -94,14 +143,35 @@ def extract_features(mols,feature_factory=None):
     xs = []
     ys = []
     zs = []
+    end_index=0
+    # loop over molecules and extract ph4 features
     for m in mols:
         feats = feature_factory.GetFeaturesForMol(m)
+        aromatic_positions = []
         for f in feats:
-            if f.GetFamily() != "LumpedHydrophobe": # temporary kludge to work around RDKit's bad feature definitions here
-                families.append(f.GetFamily())
-                xs.append(f.GetPos().x)
-                ys.append(f.GetPos().y)
-                zs.append(f.GetPos().z)
+            families.append(f.GetFamily())
+            xs.append(f.GetPos().x)
+            ys.append(f.GetPos().y)
+            zs.append(f.GetPos().z)
+        # some kludge to get around rdkit's bad feature definitions
+        # (removing lumped hydrophobes that overlap with aromatics)
+            if f.GetFamily().lower()=='aromatic':
+                aromatic_positions.append((f.GetPos().x,f.GetPos().y,f.GetPos().z))
+        bad_indices = []
+        for i in range(len(feats)):
+            f = feats[i]
+            if f.GetFamily().lower()=='lumpedhydrophobe':
+                pos = (f.GetPos().x,f.GetPos().y,f.GetPos().z)
+                if pos in aromatic_positions:
+                    bad_indices.append(i)
+        bad_indices = [x+end_index for x in bad_indices]
+        for i in sorted(bad_indices,reverse=True):
+            del families[i]
+            del xs[i]
+            del ys[i]
+            del zs[i]
+        end_index=len(families)
+    # pack data into pd.DataFrame
     feat_df = pd.DataFrame({"Family":families,'x':xs,'y':ys,'z':zs})
     return feat_df
 
@@ -110,19 +180,27 @@ def align_conformers(mols,ref_mol=None):
     Canonicalize all conformers of input molecules and align them
     Args:
     mols: iterable of rdMol objects
+    ref_mol: reference molecule to align to. will use first molecule if none provided
     Returns:
+    RMSDs: list of RMSD values for optimal alignments. lower indicates better alignment
+    scores: list of scores produced by O3A for optimal alignments. higher indicates better alignment
     '''
     if ref_mol==None:
         ref_mol = mols[0]
+    # extract molecule properties for aligner
     ref_params = AllChem.MMFFGetMoleculeProperties(ref_mol)
     RMSDs = []
     scores = []
+    # loop over query molecules to align
     for m in mols:
+        # canonicalize conformers first to have consistent starting point
         rdMolTransforms.CanonicalizeMol(m)
         mmff_params=AllChem.MMFFGetMoleculeProperties(m)
         mol_scores={}
         mol_RMSDs = {}
+        # get Aligner objects for each conformer
         aligners = rdMolAlign.GetO3AForProbeConfs(m,ref_mol,1,mmff_params,ref_params)
+        # loop over conformers and run alignments
         for i in range(len(aligners)):
             rmsd = aligners[i].Align()
             conf = m.GetConformers()[i]
@@ -135,42 +213,72 @@ def align_conformers(mols,ref_mol=None):
     return RMSDs,scores
 
 def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=None):
+    '''
+    Cluster pharmacophore features, either by hierarchical or k-means clustering
+    Args:
+    feats: pd.DataFrame of ph4 features to cluster. column names should include 'Family', 'x', 'y', 'z'
+    clust_method: clustering method to use ('hierarchical' or 'k-means')
+    max_n: maximum number of clusters to consider in screen
+    random_state: seed for randomization, used for k-means clustering
+    Returns:
+    clustered_feats: pd.DataFrame of features with cluster IDs added
+    clust_qc: tuple of (best_n,max_silhouette,silhouettes) returned by optimal clustering functions'''
     clustered_feats = []
     clust_qc = {}
+    # only want to cluster feats within each feature type
     feats_by_fam = feats.groupby('Family')
     for fam, group in feats_by_fam:
         pos_matrix = group[['x','y','z']].to_numpy()
+        # reduce max_n if there aren't enough features to cluster
+        if max_n>np.shape(pos_matrix)[0]-1:
+            max_n = np.shape(pos_matrix)[0]-1
+        # run optimal clustering
         if clust_method == 'hierarchical':
-            opt_clusts, best_n, min_silhouette, silhouettes = optimal_hierarchical_clustering(pos_matrix,
+            opt_clusts, best_n, max_silhouette, silhouettes = optimal_hierarchical_clustering(pos_matrix,
                                                                                               min_nclust=2,
                                                                                               max_nclust=max_n)
         elif clust_method=='k_means':
-            opt_clusts,best_n,min_silhouette,silhouettes = optimal_kmeans(pos_matrix, min_k=2, max_k=max_n,
+            opt_clusts,best_n,max_silhouette,silhouettes = optimal_kmeans(pos_matrix, min_k=2, max_k=max_n,
                                                                           random_state=random_state)
+        # assign cluster IDs to features
         group['Cluster'] = opt_clusts
         if len(clustered_feats)==0:
             clustered_feats = [group]
         else:
             clustered_feats.append(group)
-        clust_qc[fam] = (best_n,min_silhouette,silhouettes)
+        # package QC information
+        clust_qc[fam] = (best_n,max_silhouette,silhouettes)
     clustered_feats = pd.concat(clustered_feats).reset_index(drop=True)
     return clustered_feats, clust_qc
 
 def compute_feature_centroid_sigma(feats):
+    '''
+    Compute centroid and Gaussian sigma for consensus feature clusters
+    Args:
+    feats: pd.DataFrame of ph4 features, with cluster IDs
+    Returns:
+    consensus_feats: pd.DataFrame of consensus features, with (x,y,z) position set to cluster centroids
+        and Gaussian sigma reported'''
     consensus_feats = []
+    # extract feature clusters by family
     feats_by_fam = feats.groupby('Family')
     for fam, group in feats_by_fam:
         clusts = group.groupby('Cluster')
         for clust, g in clusts:
             n_feats = len(g)
+            # only do centroid and standard deviation calculation if cluster has more than one feature
             if n_feats > 1:
                 pos_matrix = g[['x','y','z']].to_numpy()
                 centroid = np.average(pos_matrix,axis=0)
+                # calculate standard deviation from covariance matrix
+                # treat each consensus feature as a sphere, so use average
                 cov = np.cov(pos_matrix.T)
-                sigma = np.average(np.diag(cov))
+                gauss_sigma = np.average(np.diag(cov))
+                sigma = np.sqrt(gauss_sigma**2+1.08265**2) # add variance of a single "color atom"; value from PubChem3D
             else:
-                centroid = g[['x','y','z']].to_numpy()
-                sigma = 1.0265
+                centroid = g[['x','y','z']].to_numpy()[0]
+                sigma = 1.08265 # default value used by PubChem3D
+                ## see https://jcheminf.biomedcentral.com/articles/10.1186/1758-2946-3-13
             consensus_clust = pd.DataFrame({'Family':[fam],'x':[centroid[0]],'y':[centroid[1]],
                                             'z':[centroid[2]],'sigma':[sigma],'n_feats':[n_feats]})
             consensus_feats.append(consensus_clust)
@@ -179,6 +287,22 @@ def compute_feature_centroid_sigma(feats):
 
 def cluster_by_fingerprint(mols,fp_method='RDKit',all_confs=False,
                         clust_method='k_means',max_k=10,random_state=None):
+    '''
+    Cluster rdMol objects based on molecular fingerprints
+    Args:
+    mols: list of rdMol objects to be clustered
+    fp_method: fingerprint generation method to use
+    all_confs: if True, cluster each conformer of input molecules separately. only works if fp_method=='atom_pair'
+    clust_method: clustering method to use ('k_means' only for now, 'hierarchical' should be supported eventually)
+    max_k: maximum number of clusters to attempt
+    random_state: seed for randomization
+    Returns:
+    clust_dict: dictionary with keys=cluster IDs and values=list of molecules in each cluster
+    umap_fit: UMAP dimensionality reduction representation of input mols
+    clusts: clusters returned by optimal clustering function
+    largest_clust: ID of largest cluster
+    clust_qc: QC metrics returned by optimal clustering function
+    '''
     if fp_method == 'RDKit':
         fpgen = AllChem.GetRDKitFPGenerator()
     elif fp_method == 'atom_pair':
@@ -313,50 +437,180 @@ class PharmMapper:
         self.potkey = potency_key
     
     def __unpack_conformers(self,rep_only=True,dist_thresh=1.5):
+        '''
+        Unpack rdMol objects with multiple conformers into new rdMol objects with one conformer each
+        Args:
+        rep_only: whether to return only representative conformers or all conformers
+        dist_thresh: maximum neighbor distance for representative conformer clustering
+        Returns:
+        new_mols: list of rdMol objects with one conformer each
+        '''
         new_mols=[]
         for m in self.mols:
             if len(m.GetConformers())>1:
                 if rep_only:
+                    # extract representative conformers if desired
                     _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
                                                                     make_mols=True)
                     new_mols = new_mols + mols_to_use
                 else:
+                    # unpack all conformers into new rdMol objects
                     for c in m.GetConformers():
                         nm=Chem.Mol(m,confId=c.GetId())
                         new_mols.append(nm)
             else:
+                # skip unpacking if molecule already has single conformer
                 new_mols.append(m)
         return new_mols
 
     def __split_actives_inactives(self,thresh=0.1):
-        for m in self.training_mols():
-            if m.GetDoubleProp<=thresh:
+        '''
+        Split training molecules into actives and inactives based on user-set potency threshold
+        Args:
+        thresh: cutoff value for potency metric (values less than thresh are active, greater are inactive)
+        Returns: none'''
+        for m in self.training_mols:
+            if m.GetDoubleProp(self.potkey)<=thresh:
                 self.hits.append(m)
             else:
                 self.decoys.append(m)
 
-    def prepare_training_set(self,dist_thresh=1.5,potency_thresh=0.1):
-            self.training_mols = self.__unpack_conformers(rep_only=True,dist_thresh=dist_thresh)
-            RMSDs,scores = align_conformers(self.training_mols)
-            self.__split_actives_inactives(thresh=potency_thresh)
+    def prepare_training_set(self,dist_thresh=1.5,potency_thresh=0.1,rep_only=True):
+        '''
+        Unpack and align molecules to prepare them for consensus feature identification
+        Args:
+        dist_thresh: maximum neighbor distance for representative conformer clustering
+        potency_thresh: cutoff value for potency metric (values less than thresh are active, greater are inactive)
+        rep_only: whether to return only representative conformers or all conformers
+        Returns: none
+        '''
+        self.training_mols = self.__unpack_conformers(rep_only=rep_only,dist_thresh=dist_thresh)
+        RMSDs,scores = align_conformers(self.training_mols)
+        self.__split_actives_inactives(thresh=potency_thresh)
 
 
-    def generate_training_features(self,clust_method='hierarchical',max_n=10,random_state=None):
+    def generate_training_features(self,clust_method='hierarchical',max_n_hits=10,
+                                   max_n_decoys=30,random_state=None):
+        '''
+        Extract consensus ph4 features from identified hits and decoys
+        Args:
+        clust_method: clustering method to use ('hierarchical' or 'k_means')
+        max_n_hits: maximum number of clusters to attempt when clustering features from hits
+        max_n_decoys: maximum number of clusters to attempt when clustering features from decoys
+        random_state: seed for randomization
+        Returns: none
+        '''
         allhits = extract_features(self.hits,self.ff)
         alldecoys = extract_features(self.decoys,self.ff)
         hit_clusts,_ = cluster_features(allhits,clust_method=clust_method,
-                                        max_n=max_n,random_state=random_state)
+                                        max_n=max_n_hits,random_state=random_state)
         self.consensus_hits = compute_feature_centroid_sigma(hit_clusts)
+        self.consensus_hits['Class']=['active']*len(self.consensus_hits)
         decoy_clusts,_ = cluster_features(alldecoys,clust_method=clust_method,
-                                          max_n=max_n,random_state=random_state)
+                                          max_n=max_n_decoys,random_state=random_state)
         self.consensus_decoys = compute_feature_centroid_sigma(decoy_clusts)
+        self.consensus_decoys['Class']=['inactive']*len(self.consensus_decoys)
 
-    def train(self,dist_thresh=1.5,potency_thresh=0.1,clust_method='hierarchical',max_n=10,random_state=None):
-        self.prepare_training_set(dist_thresh=dist_thresh,potency_thresh=potency_thresh)
-        self.generate_training_features(self,clust_method=clust_method,max_n=max_n,random_state=random_state)
+    def __find_structural_features(self,sim_cutoff):
+        '''
+        Identify features of high similarity between active and inactive feature sets
+        Args:
+        sim_cutoff: similarity cutoff above which two features will be considered matched
+        Returns: none
+        '''
+        # initialize distance and similarity matrices
+        dists = np.full((len(self.consensus_hits),len(self.consensus_decoys)),np.inf)
+        similarities = np.zeros((len(self.consensus_hits),len(self.consensus_decoys)))
+        # loop over all feature pairs
+        for i in range(len(self.consensus_hits)):
+            for j in range(len(self.consensus_decoys)):
+                # only consider pairs of same feature type
+                if self.consensus_decoys['Family'].iloc[j]==self.consensus_hits['Family'].iloc[i]:
+                    # extract feature positions and sigmas
+                    pos1 = self.consensus_hits[['x','y','z']].iloc[i].to_numpy()
+                    pos2 = self.consensus_decoys[['x','y','z']].iloc[j].to_numpy()
+                    sig1 = self.consensus_hits['sigma'].iloc[i]
+                    sig2 = self.consensus_decoys['sigma'].iloc[j]
+                    # calculate Euclidean distance between centroids
+                    dist = np.linalg.norm(pos2-pos1)
+                    # calculate Tanimoto similarity of Gaussian volumes
+                    overlap = 2*2.7*(np.pi/(sig1+sig2))**(3/2)*np.exp(-sig1*sig2*dist**2/(sig1+sig2))
+                    self_overlap1 = 2*2.7*(np.pi/(sig1+sig1))**(3/2)
+                    self_overlap2 = 2*2.7*(np.pi/(sig2+sig2))**(3/2)
+                    sim = overlap/(self_overlap1+self_overlap2-overlap)
+                    # record values
+                    similarities[i,j]=sim
+                    dists[i,j]=dist
+        # find maximum similarity scores for each active feature
+        max_sim_indices_1 = np.argmax(similarities,axis=1)
+        # mark feature as matched if maximum score is above cutoff
+        matched1 = [True if similarities[i,max_sim_indices_1[i]]>sim_cutoff else False 
+                    for i in range(len(self.consensus_hits))]
+        # record ID of matching feature if applicable
+        match_indices_1 = [int(max_sim_indices_1[i]) if matched1[i]==True else None 
+                           for i in range(len(self.consensus_hits))]
+        # save info to hits DataFrame
+        self.consensus_hits['Matched']=matched1
+        self.consensus_hits['Match Partner']=match_indices_1
+        self.consensus_hits['Maximum Similarity']=np.max(similarities,axis=1).tolist()
+        # repeat the above process for decoys
+        max_sim_indices_2 = np.argmax(similarities,axis=0)
+        matched2 = [True if similarities[max_sim_indices_2[j],j]>sim_cutoff else False 
+                    for j in range(len(self.consensus_decoys))]
+        match_indices_2 = [int(max_sim_indices_2[j]) if matched2[j]==True else None 
+                           for j in range(len(self.consensus_decoys))]
+        self.consensus_decoys['Matched']=matched2
+        self.consensus_decoys['Match Partner']=match_indices_2
+        self.consensus_decoys['Maximum Similarity']=np.max(similarities,axis=0).tolist()
 
-    def read_ph4(self,ph4_file):
-        pass
+    def __assign_scoring_weights(self):
+        '''Assign scoring weights to consensus features
+        Args: none
+        Returns: none
+        '''
+        for f in [self.consensus_hits,self.consensus_decoys]:
+            # if feature was matched between actives and inactives, set weight to 1 (minimum)
+            # else, set weight to number of contributing features
+            # more common features within a dataset should count more
+            weights=[1 if f['Matched'].iloc[i]==True else f['n_feats'].iloc[i]
+                     for i in range(len(f))]
+            f['Weight'] = weights
+
+    def train(self,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,
+              method='hierarchical',max_n_hits=10,max_n_decoys=30,
+              sim_cutoff=0.75,random_state=None):
+        '''
+        Perform consensus feature identification pipeline
+        Args:
+        dist_thresh: maximum neighbor distance for representative conformer clustering
+        potency_thresh: cutoff value for potency metric (values less than thresh are active, greater are inactive)
+        rep_only: whether to return only representative conformers or all conformers
+        method: clustering method to use ('hierarchical' or 'k_means')
+        max_n_hits: maximum number of clusters to attempt when clustering features from hits
+        max_n_decoys: maximum number of clusters to attempt when clustering features from decoys
+        sim_cutoff: similarity cutoff above which two features will be considered matched
+        random_state: seed for randomization
+        Returns: none
+        '''
+        self.prepare_training_set(dist_thresh=dist_thresh,potency_thresh=potency_thresh,
+                                  rep_only=rep_only)
+        self.generate_training_features(clust_method=method,max_n_hits=max_n_hits,
+                                        max_n_decoys=max_n_decoys,random_state=random_state)
+        self.__find_structural_features(sim_cutoff=sim_cutoff)
+        self.__assign_scoring_weights()
+        self.all_feats = pd.concat([self.consensus_hits,self.consensus_decoys])
+
+    def pickle_training_feats(self,filepath):
+        # save consensus features to pickle for later use
+        with open(filepath,'wb') as file:
+            pickle.dump(self.all_feats,file)
+
+    def read_ph4_pickle(self,ph4_file):
+        # load consensus features from pickle and split into actives and inactives
+        with open(ph4_file,'rb') as file:
+            self.all_feats = pickle.load(file)
+        self.consensus_hits=self.all_feats.loc[self.all_feats['Class']=='active']
+        self.consensus_decoys=self.all_feats.loc[self.all_feats['Class']=='inactive']
 
 ### Things below this point are likely not useful
     
