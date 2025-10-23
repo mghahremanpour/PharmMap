@@ -22,7 +22,7 @@ import sklearn as skl
 import umap
 DrawingOptions.includeAtomNumbers=True
 
-def optimal_kmeans(data,min_k=2,max_k=10,random_state=None):
+def optimal_kmeans(data,min_k,max_k,random_state=None):
     '''
     Determines optimal k for k-means clustering and performs clustering at optimal value
     Args:
@@ -262,6 +262,10 @@ def compute_feature_centroid_sigma(feats):
     consensus_feats = []
     # extract feature clusters by family
     feats_by_fam = feats.groupby('Family')
+    default_radius = 1.08265 # default value used by PubChem3D
+    ## see https://jcheminf.biomedcentral.com/articles/10.1186/1758-2946-3-13
+    default_sigma = (np.pi*(3*np.sqrt(2)/(2*np.pi))**(2/3))*default_radius**(-2)
+    # calculated as per https://onlinelibrary.wiley.com/doi/full/10.1002/jcc.21307
     for fam, group in feats_by_fam:
         clusts = group.groupby('Cluster')
         for clust, g in clusts:
@@ -274,10 +278,10 @@ def compute_feature_centroid_sigma(feats):
                 # treat each consensus feature as a sphere, so use average
                 cov = np.cov(pos_matrix.T)
                 gauss_sigma = np.average(np.diag(cov))
-                sigma = np.sqrt(gauss_sigma**2+1.08265**2) # add variance of a single "color atom"; value from PubChem3D
+                sigma = np.sqrt(gauss_sigma**2+default_sigma**2) # add variance of a single "color atom"; value from PubChem3D
             else:
                 centroid = g[['x','y','z']].to_numpy()[0]
-                sigma = 1.08265 # default value used by PubChem3D
+                sigma = default_sigma # default value used by PubChem3D
                 ## see https://jcheminf.biomedcentral.com/articles/10.1186/1758-2946-3-13
             consensus_clust = pd.DataFrame({'Family':[fam],'x':[centroid[0]],'y':[centroid[1]],
                                             'z':[centroid[2]],'sigma':[sigma],'n_feats':[n_feats]})
@@ -576,7 +580,38 @@ class PharmMapper:
                      for i in range(len(f))]
             f['Weight'] = weights
 
-    def train(self,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,
+    def calculate_score_matrix(self,mols,default_radius=1.08265,ref_key='all'):
+        if ref_key=='all':
+            ref_feats=self.all_feats
+        elif ref_key=='active':
+            ref_feats=self.consensus_hits
+        elif ref_key=='inactive':
+            ref_feats=self.consensus_decoys
+        score_mat = np.zeros((len(mols),len(ref_feats)))
+        default_sigma = (np.pi*(3*np.sqrt(2)/(2*np.pi))**(2/3))*default_radius**(-2)
+        def calc_overlaps(row):
+            if type(row['Query Positions'])!=bool:
+                dists = scipy.spatial.distance.cdist(row[['x','y','z']].to_numpy().reshape(-1,3).astype(float),
+                                                     row['Query Positions'])
+                overlap = np.sum(2*2.7*(np.pi/(row['sigma']+default_sigma))**(3/2)*
+                                np.exp((-default_sigma*row['sigma']*dists**2)/
+                                (default_sigma+row['sigma'])))
+            else:
+                overlap = 0
+            return overlap
+        for i in range(len(mols)):
+            feats = extract_features([mols[i]])
+            feats_by_group = feats.groupby('Family')
+            ref_feats['Query Positions'] = [feats_by_group.get_group(f)[['x','y','z']].to_numpy()
+                                            if f in feats_by_group.groups else False
+                                            for f in ref_feats['Family']]
+            ref_feats['Overlaps'] = ref_feats.apply(calc_overlaps,axis=1)
+            score_mat[i,:] = ref_feats['Overlaps']/(2*2.7*(np.pi/(ref_feats['sigma']*2))**(3/2))
+        ref_feats.drop('Query Positions',axis=1,inplace=True)
+        ref_feats.drop('Overlaps',axis=1,inplace=True)
+        return score_mat
+
+    def make_consensus_ph4(self,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,
               method='hierarchical',max_n_hits=10,max_n_decoys=30,
               sim_cutoff=0.75,random_state=None):
         '''
