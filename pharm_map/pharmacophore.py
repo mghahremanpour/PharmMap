@@ -22,7 +22,7 @@ import sklearn as skl
 import umap
 DrawingOptions.includeAtomNumbers=True
 
-def optimal_kmeans(data,min_k,max_k,random_state=None):
+def optimal_kmeans(data,min_k=2,max_k=10,random_state=None):
     '''
     Determines optimal k for k-means clustering and performs clustering at optimal value
     Args:
@@ -80,6 +80,14 @@ def optimal_hierarchical_clustering(data,min_nclust,max_nclust):
     opt_clusterer = skl.cluster.AgglomerativeClustering(n_clusters=best_n)
     opt_clusts = opt_clusterer.fit_predict(data)
     return opt_clusts, best_n, max_silhouette, silhouettes
+
+def confs_from_smiles(smiles,num_embed=100,align=True,random_seed=-1):
+    mol = Chem.MolFromSmiles(smiles)
+    mol = Chem.AddHs(mol)
+    confs = AllChem.EmbedMultipleConfs(mol,numConfs=num_embed,randomSeed=random_seed)
+    optimize_res = AllChem.MMFFOptimizeMoleculeConfs(mol)
+    AllChem.AlignMolConformers(mol)
+    return mol
 
 def generate_LE_conformers(mols,embed_count=100,random_seed=-1,save=False,filename=None):
     out_mols = []
@@ -434,11 +442,38 @@ class PharmMapper:
     hits=[]
     decoys=[]
 
-    def __init__(self,mols,feature_factory=None,potency_key='IC50'):
-        self.mols=mols
+    def __init__(self,train_mols,test_mols,feature_factory=None,potency_key='IC50'):
+        self.train_mols=train_mols
+        self.test_mols = test_mols
         if feature_factory:
             self.ff = feature_factory
         self.potkey = potency_key
+        
+    @classmethod
+    def from_pickle(cls,filename):
+        '''
+        Reconstruct PharmMapper from a previously pickled PharmMapper
+        Args:
+        filename: name of pickle file containing PharmMapper information
+        Returns:
+        mapper: reconstructed PharmMapper
+        '''
+        with open(filename,'rb') as file:
+            ph4_dict = pickle.load(file)
+        mapper = cls(ph4_dict['train_mols'],ph4_dict['test_mols'],
+                     feature_factory=ph4_dict['feature_factory'],
+                     potency_key=ph4_dict['potkey'])
+        if 'all_feats' in ph4_dict.keys():
+            mapper.all_feats=ph4_dict['all_feats']
+            mapper.consensus_hits=mapper.all_feats.loc[mapper.all_feats['Class']=='active']
+            mapper.consensus_decoys=mapper.all_feats.loc[mapper.all_feats['Class']=='inactive']
+        if 'scaffold' in ph4_dict.keys():
+            mapper.scaffold=ph4_dict['scaffold']
+        if 'classifier' in ph4_dict.keys():
+            mapper.classifier=ph4_dict['classifier']
+        return mapper
+            
+            
     
     def __unpack_conformers(self,rep_only=True,dist_thresh=1.5):
         '''
@@ -449,23 +484,39 @@ class PharmMapper:
         Returns:
         new_mols: list of rdMol objects with one conformer each
         '''
-        new_mols=[]
-        for m in self.mols:
+        new_train_mols=[]
+        new_test_mols=[]
+        for m in self.train_mols:
             if len(m.GetConformers())>1:
                 if rep_only:
                     # extract representative conformers if desired
                     _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
                                                                     make_mols=True)
-                    new_mols = new_mols + mols_to_use
+                    new_train_mols = new_train_mols + mols_to_use
                 else:
                     # unpack all conformers into new rdMol objects
                     for c in m.GetConformers():
                         nm=Chem.Mol(m,confId=c.GetId())
-                        new_mols.append(nm)
+                        new_train_mols.append(nm)
             else:
                 # skip unpacking if molecule already has single conformer
-                new_mols.append(m)
-        return new_mols
+                new_train_mols.append(m)
+        for m in self.test_mols:
+            if len(m.GetConformers())>1:
+                if rep_only:
+                    # extract representative conformers if desired
+                    _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
+                                                                    make_mols=True)
+                    new_test_mols = new_train_mols + mols_to_use
+                else:
+                    # unpack all conformers into new rdMol objects
+                    for c in m.GetConformers():
+                        nm=Chem.Mol(m,confId=c.GetId())
+                        new_test_mols.append(nm)
+            else:
+                # skip unpacking if molecule already has single conformer
+                new_test_mols.append(m)
+        return new_train_mols,new_test_mols
 
     def __split_actives_inactives(self,thresh=0.1):
         '''
@@ -473,13 +524,13 @@ class PharmMapper:
         Args:
         thresh: cutoff value for potency metric (values less than thresh are active, greater are inactive)
         Returns: none'''
-        for m in self.training_mols:
+        for m in self.train_mols:
             if m.GetDoubleProp(self.potkey)<=thresh:
                 self.hits.append(m)
             else:
                 self.decoys.append(m)
 
-    def prepare_training_set(self,dist_thresh=1.5,potency_thresh=0.1,rep_only=True):
+    def prepare_mols(self,dist_thresh=1.5,potency_thresh=0.1,rep_only=True):
         '''
         Unpack and align molecules to prepare them for consensus feature identification
         Args:
@@ -488,9 +539,10 @@ class PharmMapper:
         rep_only: whether to return only representative conformers or all conformers
         Returns: none
         '''
-        self.training_mols = self.__unpack_conformers(rep_only=rep_only,dist_thresh=dist_thresh)
-        RMSDs,scores = align_conformers(self.training_mols)
+        self.train_mols,self.test_mols = self.__unpack_conformers(rep_only=rep_only,dist_thresh=dist_thresh)
+        RMSDs,scores = align_conformers(self.train_mols)
         self.__split_actives_inactives(thresh=potency_thresh)
+        self.scaffold = self.train_mols[0]
 
 
     def generate_training_features(self,clust_method='hierarchical',max_n_hits=10,
@@ -569,6 +621,7 @@ class PharmMapper:
 
     def __assign_scoring_weights(self):
         '''Assign scoring weights to consensus features
+            (defaults to number of component features for each consensus feature)
         Args: none
         Returns: none
         '''
@@ -579,16 +632,32 @@ class PharmMapper:
             weights=[1 if f['Matched'].iloc[i]==True else f['n_feats'].iloc[i]
                      for i in range(len(f))]
             f['Weight'] = weights
-
+            
     def calculate_score_matrix(self,mols,default_radius=1.08265,ref_key='all'):
+        '''
+        Calculate matrix of volumetric overlaps between a set of molecules and reference pharmacophore
+        Args:
+        mols: query molecules to calculate scores for
+        default_radius: radius assigned to "color atoms" - i.e. if the centroid of a pharmacophore feature was
+            represented by an atom, it would have this van der Waals radius
+        ref_key: which reference features to use to calculate scores ('all', 'active', or 'inactive')
+        Returns:
+        score_mat: np.array of shape (len(mols),len(features)) containing volumetric overlap scores of each
+            query molecule with each reference feature. scores are calculated by Tversky similarity with alpha=1
+            (score = v_overlap/v_feature)
+        '''
+        # get the desired reference features from the consensus map(s)
         if ref_key=='all':
             ref_feats=self.all_feats
         elif ref_key=='active':
             ref_feats=self.consensus_hits
         elif ref_key=='inactive':
             ref_feats=self.consensus_decoys
+        # initialize score matrix
         score_mat = np.zeros((len(mols),len(ref_feats)))
+        # calculate standard deviation of color atoms
         default_sigma = (np.pi*(3*np.sqrt(2)/(2*np.pi))**(2/3))*default_radius**(-2)
+        # helper sub-function to calculate volume overlaps between features of the same type
         def calc_overlaps(row):
             if type(row['Query Positions'])!=bool:
                 dists = scipy.spatial.distance.cdist(row[['x','y','z']].to_numpy().reshape(-1,3).astype(float),
@@ -599,14 +668,20 @@ class PharmMapper:
             else:
                 overlap = 0
             return overlap
+        # loop over query molecules and calculate overlap scores
         for i in range(len(mols)):
+            # extract query features and group by feature type
             feats = extract_features([mols[i]])
             feats_by_group = feats.groupby('Family')
+            # get positions of query features that match type of each reference feature
             ref_feats['Query Positions'] = [feats_by_group.get_group(f)[['x','y','z']].to_numpy()
                                             if f in feats_by_group.groups else False
                                             for f in ref_feats['Family']]
+            # calculate Gaussian volume overlaps
             ref_feats['Overlaps'] = ref_feats.apply(calc_overlaps,axis=1)
+            # calculate Tversky scores of overlaps, using reference feature volume as denominator
             score_mat[i,:] = ref_feats['Overlaps']/(2*2.7*(np.pi/(ref_feats['sigma']*2))**(3/2))
+        # clean up reference feature dataframe
         ref_feats.drop('Query Positions',axis=1,inplace=True)
         ref_feats.drop('Overlaps',axis=1,inplace=True)
         return score_mat
@@ -627,25 +702,136 @@ class PharmMapper:
         random_state: seed for randomization
         Returns: none
         '''
-        self.prepare_training_set(dist_thresh=dist_thresh,potency_thresh=potency_thresh,
+        self.prepare_mols(dist_thresh=dist_thresh,potency_thresh=potency_thresh,
                                   rep_only=rep_only)
         self.generate_training_features(clust_method=method,max_n_hits=max_n_hits,
                                         max_n_decoys=max_n_decoys,random_state=random_state)
         self.__find_structural_features(sim_cutoff=sim_cutoff)
         self.__assign_scoring_weights()
         self.all_feats = pd.concat([self.consensus_hits,self.consensus_decoys])
-
-    def pickle_training_feats(self,filepath):
+        
+    def make_classifier(self):
+        '''
+        Find the best-performing classifier from a variety of algorithms, and return that fitted classifier
+        Args:none
+        Returns:
+        self.classifier: fitted classifier
+        roc: mean ROC-AUC of best-performing classifier, from cross-validation
+        results: list of dicts containing cross-validation results, potentially useful for downstream plotting
+        '''
+        self.training_scores = self.calculate_score_matrix(self.hits+self.decoys)
+        self.training_labels = [1]*len(self.hits)+[0]*len(self.decoys)
+        # scale scores, since Tversky scores can be >1
+        scaler = skl.preprocessing.StandardScaler()
+        scaled_scores = scaler.fit_transform(self.training_scores)
+        # make Trainer, run cross-validation on range of classifiers and get best one
+        self.trainer = Trainer(scaled_scores,self.training_labels)
+        self.classifier,roc,results = self.trainer.find_best_classifier()
+        # fit the best classifier on all the scaled training scores
+        self.classifier.fit(scaled_scores,self.training_labels)
+        return self.classifier,roc,results
+    
+    def predict(self):
+        '''
+        Use a fitted classifier to predict active/inactive probabilities for test set molecules
+        Args: none
+        Returns:
+        self.test_probs: array of shape (len(test_mols),2) containing class probabilities for each test compound
+        '''
+        # calculate volumetric overlap scores
+        self.test_overlaps = self.calculate_score_matrix(self.test_mols)
+        # scale scores, since Tversky scores can be >1
+        scaler = skl.preprocessing.StandardScaler()
+        scaled_scores = scaler.fit_transform(self.test_overlaps)
+        # predict class probabilities using pre-trained classifier
+        self.test_probs = self.classifier.predict_proba(scaled_scores)
+        return self.test_probs
+         
+    def save(self,filename):
+        '''
+        Save mapper information to pickle for later reuse
+        Args:
+        filename: str name of file to save to
+        Returns: none
+        '''
+        ph4_dict = {}
+        if self.scaffold:
+            ph4_dict['scaffold']=self.scaffold
+        if self.all_feats:
+            ph4_dict['all_feats']=self.all_feats
+        if self.classifier:
+            ph4_dict['classifier']=self.classifier
+        if self.hits:
+            ph4_dict['hits']=self.hits
+            ph4_dict['decoys']=self.decoys
+        ph4_dict['ff']=self.feature_factory
+        ph4_dict['potkey']=self.potkey
+        ph4_dict['train_mols']=self.train_mols
+        ph4_dict['test_mols']=self.test_mols
+        with open(filename,'wb') as file:
+            pickle.dump(ph4_dict,file)
+        
+    def save_training_feats(self,filepath):
         # save consensus features to pickle for later use
         with open(filepath,'wb') as file:
             pickle.dump(self.all_feats,file)
 
-    def read_ph4_pickle(self,ph4_file):
+    def read_ph4(self,ph4_file):
         # load consensus features from pickle and split into actives and inactives
         with open(ph4_file,'rb') as file:
             self.all_feats = pickle.load(file)
         self.consensus_hits=self.all_feats.loc[self.all_feats['Class']=='active']
         self.consensus_decoys=self.all_feats.loc[self.all_feats['Class']=='inactive']
+        
+class Trainer:
+    '''
+    Class to handle classifier model selection and training
+    '''
+    def __init__(self,train_data,train_labels):
+        self.X = train_data
+        self.y = train_labels
+        
+    def find_best_classifier(self):
+        '''
+        Try a range of classifier models and select the one with best ROC-AUC, using default parameters
+        Args: none
+        Returns:
+        best_classifier: unfitted classifier model of type that hda best cross-validation performance
+        self.roc_aucs[best_i]: mean ROC-AUC of best performing model in cross-validation
+        classifier_opt_results: list of dicts containing cross-validation outputs, potentially useful for downstream analysis
+        '''
+        self.svm = skl.svm.SVC(probability=True)
+        self.sgd = skl.linear_model.SGDClassifier(loss='modified_huber')
+        self.k_neighbors = skl.neighbors.KNeighborsClassifier()
+        self.hgbc = skl.ensemble.HistGradientBoostingClassifier()
+        self.kernel_approx = skl.kernel_approximation.Nystroem()
+        self.kernel_sgd = skl.linear_model.SGDClassifier(loss='modified_huber')
+        self.classifiers = [self.svm,self.sgd,self.k_neighbors,self.hgbc]
+        self.classifier_opt_results = []
+        self.roc_aucs = []
+        for c in self.classifiers:
+            results = skl.model_selection.cross_validate(c,self.X,self.y,scoring='roc_auc',
+                                                         return_estimator=True,return_indices=True)
+            r_array = results['test_score']
+            r = np.mean(r_array)
+            self.roc_aucs.append(r)
+            self.classifier_opt_results.append(results)
+        self.classifiers.append(self.kernel_sgd)
+        results_kernel = skl.model_selection.cross_validate(self.kernel_sgd,self.X,self.y,scoring='roc_auc',
+                                                           return_estimator=True,return_indices=True)
+        self.roc_aucs.append(np.mean(results_kernel['test_score']))
+        self.classifier_opt_results.append(results_kernel)
+        best_i = np.argmax(self.roc_aucs)
+        best_classifier = self.classifiers[best_i]
+        self.model = best_classifier
+        return best_classifier,self.roc_aucs[best_i],self.classifier_opt_results  
+    
+    def parameter_sweep(self,classifier,param_grid):
+        '''
+        Perform cross-validated parameter sweep on a classifier to optimize hyperparameters
+        '''
+        pass
+    
 
 ### Things below this point are likely not useful
     
