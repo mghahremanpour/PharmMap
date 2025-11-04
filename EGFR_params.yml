@@ -1,0 +1,13 @@
+random_seed: 20251104
+
+features:
+  default_radius: 1.08265
+  feature_factory: null
+
+consensus:
+  dist_thresh: 1.5
+  rep_only: True
+  clust_method: 'hierarchical'
+  max_hit_feats: 50
+  max_decoy_feats: 50
+  sim_cutoff: 0.75

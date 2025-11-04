@@ -2,7 +2,7 @@ import numpy as np
 import rdkit
 import pandas as pd
 import matplotlib.pyplot as plt
-from rdkit import Chem, RDConfig, Geometry, RDLogger
+from rdkit import Chem, RDConfig, Geometry, RDLogger, DataStructs
 from rdkit.Chem import AllChem, ChemicalFeatures, rdDistGeom, rdMolTransforms, rdShapeAlign, Draw, rdChemicalFeatures, rdMolAlign
 from rdkit.Chem.Pharm3D import Pharmacophore, EmbedLib
 from rdkit.Numerics import rdAlignment
@@ -259,19 +259,18 @@ def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=Non
     clustered_feats = pd.concat(clustered_feats).reset_index(drop=True)
     return clustered_feats, clust_qc
 
-def compute_feature_centroid_sigma(feats):
+def compute_feature_centroid_sigma(feats,default_radius=1.08265):
     '''
     Compute centroid and Gaussian sigma for consensus feature clusters
     Args:
     feats: pd.DataFrame of ph4 features, with cluster IDs
+    default_radius: radius of a single "color atom"; default value from PubChem3D (see https://jcheminf.biomedcentral.com/articles/10.1186/1758-2946-3-13)
     Returns:
     consensus_feats: pd.DataFrame of consensus features, with (x,y,z) position set to cluster centroids
         and Gaussian sigma reported'''
     consensus_feats = []
     # extract feature clusters by family
     feats_by_fam = feats.groupby('Family')
-    default_radius = 1.08265 # default value used by PubChem3D
-    ## see https://jcheminf.biomedcentral.com/articles/10.1186/1758-2946-3-13
     default_sigma = (np.pi*(3*np.sqrt(2)/(2*np.pi))**(2/3))*default_radius**(-2)
     # calculated as per https://onlinelibrary.wiley.com/doi/full/10.1002/jcc.21307
     for fam, group in feats_by_fam:
@@ -442,7 +441,7 @@ class PharmMapper:
     hits=[]
     decoys=[]
 
-    def __init__(self,train_mols,test_mols,feature_factory=None,potency_key='IC50'):
+    def __init__(self,train_mols,test_mols=None,feature_factory=None,potency_key='IC50'):
         self.train_mols=train_mols
         self.test_mols = test_mols
         if feature_factory:
@@ -501,21 +500,24 @@ class PharmMapper:
             else:
                 # skip unpacking if molecule already has single conformer
                 new_train_mols.append(m)
-        for m in self.test_mols:
-            if len(m.GetConformers())>1:
-                if rep_only:
-                    # extract representative conformers if desired
-                    _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
-                                                                    make_mols=True)
-                    new_test_mols = new_train_mols + mols_to_use
+        if self.test_mols:
+            for m in self.test_mols:
+                if len(m.GetConformers())>1:
+                    if rep_only:
+                        # extract representative conformers if desired
+                        _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
+                                                                        make_mols=True)
+                        new_test_mols = new_train_mols + mols_to_use
+                    else:
+                        # unpack all conformers into new rdMol objects
+                        for c in m.GetConformers():
+                            nm=Chem.Mol(m,confId=c.GetId())
+                            new_test_mols.append(nm)
                 else:
-                    # unpack all conformers into new rdMol objects
-                    for c in m.GetConformers():
-                        nm=Chem.Mol(m,confId=c.GetId())
-                        new_test_mols.append(nm)
-            else:
-                # skip unpacking if molecule already has single conformer
-                new_test_mols.append(m)
+                    # skip unpacking if molecule already has single conformer
+                    new_test_mols.append(m)
+        else:
+            new_test_mols=None
         return new_train_mols,new_test_mols
 
     def __split_actives_inactives(self,thresh=0.1):
@@ -530,7 +532,7 @@ class PharmMapper:
             else:
                 self.decoys.append(m)
 
-    def prepare_mols(self,dist_thresh=1.5,potency_thresh=0.1,rep_only=True):
+    def prepare_mols(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True):
         '''
         Unpack and align molecules to prepare them for consensus feature identification
         Args:
@@ -539,14 +541,15 @@ class PharmMapper:
         rep_only: whether to return only representative conformers or all conformers
         Returns: none
         '''
-        self.train_mols,self.test_mols = self.__unpack_conformers(rep_only=rep_only,dist_thresh=dist_thresh)
+        if unpack:
+            self.train_mols,self.test_mols = self.__unpack_conformers(rep_only=rep_only,dist_thresh=dist_thresh)
         RMSDs,scores = align_conformers(self.train_mols)
         self.__split_actives_inactives(thresh=potency_thresh)
         self.scaffold = self.train_mols[0]
 
 
     def generate_training_features(self,clust_method='hierarchical',max_n_hits=10,
-                                   max_n_decoys=30,random_state=None):
+                                   max_n_decoys=30,dr=1.08265,random_state=None):
         '''
         Extract consensus ph4 features from identified hits and decoys
         Args:
@@ -560,11 +563,11 @@ class PharmMapper:
         alldecoys = extract_features(self.decoys,self.ff)
         hit_clusts,_ = cluster_features(allhits,clust_method=clust_method,
                                         max_n=max_n_hits,random_state=random_state)
-        self.consensus_hits = compute_feature_centroid_sigma(hit_clusts)
+        self.consensus_hits = compute_feature_centroid_sigma(hit_clusts,default_radius=dr)
         self.consensus_hits['Class']=['active']*len(self.consensus_hits)
         decoy_clusts,_ = cluster_features(alldecoys,clust_method=clust_method,
                                           max_n=max_n_decoys,random_state=random_state)
-        self.consensus_decoys = compute_feature_centroid_sigma(decoy_clusts)
+        self.consensus_decoys = compute_feature_centroid_sigma(decoy_clusts,default_radius=dr)
         self.consensus_decoys['Class']=['inactive']*len(self.consensus_decoys)
 
     def __find_structural_features(self,sim_cutoff):
@@ -686,9 +689,9 @@ class PharmMapper:
         ref_feats.drop('Overlaps',axis=1,inplace=True)
         return score_mat
 
-    def make_consensus_ph4(self,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,
-              method='hierarchical',max_n_hits=10,max_n_decoys=30,
-              sim_cutoff=0.75,random_state=None):
+    def make_consensus_ph4(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,
+              method='hierarchical',max_n_hits=50,max_n_decoys=50,
+              sim_cutoff=0.75,dr=1.08265,random_state=None):
         '''
         Perform consensus feature identification pipeline
         Args:
@@ -702,10 +705,10 @@ class PharmMapper:
         random_state: seed for randomization
         Returns: none
         '''
-        self.prepare_mols(dist_thresh=dist_thresh,potency_thresh=potency_thresh,
+        self.prepare_mols(unpack=unpack,dist_thresh=dist_thresh,potency_thresh=potency_thresh,
                                   rep_only=rep_only)
         self.generate_training_features(clust_method=method,max_n_hits=max_n_hits,
-                                        max_n_decoys=max_n_decoys,random_state=random_state)
+                                        max_n_decoys=max_n_decoys,random_state=random_state,dr=dr)
         self.__find_structural_features(sim_cutoff=sim_cutoff)
         self.__assign_scoring_weights()
         self.all_feats = pd.concat([self.consensus_hits,self.consensus_decoys])
@@ -746,6 +749,39 @@ class PharmMapper:
         # predict class probabilities using pre-trained classifier
         self.test_probs = self.classifier.predict_proba(scaled_scores)
         return self.test_probs
+
+    def __make_fps(self):
+        '''
+        Make molecular fingerprints of all compounds
+        '''
+        fpgen = AllChem.GetRDKitFPGenerator()
+        self.train_fps = [fpgen.GetFingerprint(x) for x in self.train_mols]
+        self.test_fps = [fpgen.GetFingerprint(x) for x in self.test_mols]
+
+    
+    def calculate_train_test_similarity(self,plot=False,plotfile=None):
+        '''
+        Calculate maximum Tanimoto similarity between test molecules and training set
+        Args:
+        plot: whether to plot maximum similarities and save the plot
+        plotfile: filename to save plot to; only used if plot=True
+        Returns:
+        max_scores: list of maximum Tanimoto similarities between each test compound and the training set
+        '''
+        if not self.train_fps:
+            self.__make_fps()
+        self.train_test_sim = np.zeros(len(self.test_fps))
+        for i in range(len(self.test_fps)):
+            tanimotos = [DataStructs.TanimotoSimilarity(self.test_fps[i], f) for f in self.train_fps]
+            max_sim = np.max(tanimotos)
+            self.train_test_sim[i] = max_sim
+        if plot:
+            fig,ax = plt.subplots(1,1)
+            ax.hist(self.train_test_sim)
+            ax.set_xlabel('Maximum Tanimoto similarity')
+            ax.set_ylabel('Counts')
+            plt.savefig(plotfile,dpi=300)
+        return self.train_test_sim
          
     def save(self,filename):
         '''
