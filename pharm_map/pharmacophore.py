@@ -20,7 +20,34 @@ import py3Dmol
 import pickle
 import sklearn as skl
 import umap
+import time
+
 DrawingOptions.includeAtomNumbers=True
+def timer(func):
+
+    """
+
+    This decorator reports the execution time 
+
+    of a function.
+
+    """
+
+    def wrapper(*args, **kwargs):
+
+        start_time = time.perf_counter()
+
+        result     = func(*args, **kwargs)
+
+        end_time   = time.perf_counter()
+
+        execution_time = end_time - start_time
+
+        print(f"{func.__name__} executed in {execution_time:.4f} seconds")
+
+        return result
+
+    return wrapper
 
 def optimal_kmeans(data,min_k=2,max_k=10,random_state=None):
     '''
@@ -531,7 +558,7 @@ class PharmMapper:
                 self.hits.append(m)
             else:
                 self.decoys.append(m)
-
+    @timer
     def prepare_mols(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True):
         '''
         Unpack and align molecules to prepare them for consensus feature identification
@@ -547,7 +574,7 @@ class PharmMapper:
         self.__split_actives_inactives(thresh=potency_thresh)
         self.scaffold = self.train_mols[0]
 
-
+    @timer
     def generate_training_features(self,clust_method='hierarchical',max_n_hits=10,
                                    max_n_decoys=30,dr=1.08265,random_state=None):
         '''
@@ -635,7 +662,7 @@ class PharmMapper:
             weights=[1 if f['Matched'].iloc[i]==True else f['n_feats'].iloc[i]
                      for i in range(len(f))]
             f['Weight'] = weights
-            
+    @timer      
     def calculate_score_matrix(self,mols,default_radius=1.08265,ref_key='all'):
         '''
         Calculate matrix of volumetric overlaps between a set of molecules and reference pharmacophore
@@ -688,7 +715,7 @@ class PharmMapper:
         ref_feats.drop('Query Positions',axis=1,inplace=True)
         ref_feats.drop('Overlaps',axis=1,inplace=True)
         return score_mat
-
+    @timer
     def make_consensus_ph4(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,
               method='hierarchical',max_n_hits=50,max_n_decoys=50,
               sim_cutoff=0.75,dr=1.08265,random_state=None):
@@ -712,7 +739,7 @@ class PharmMapper:
         self.__find_structural_features(sim_cutoff=sim_cutoff)
         self.__assign_scoring_weights()
         self.all_feats = pd.concat([self.consensus_hits,self.consensus_decoys])
-        
+    @timer
     def make_classifier(self):
         '''
         Find the best-performing classifier from a variety of algorithms, and return that fitted classifier
@@ -729,11 +756,9 @@ class PharmMapper:
         scaled_scores = scaler.fit_transform(self.training_scores)
         # make Trainer, run cross-validation on range of classifiers and get best one
         self.trainer = Trainer(scaled_scores,self.training_labels)
-        self.classifier,roc,results = self.trainer.find_best_classifier()
-        # fit the best classifier on all the scaled training scores
-        self.classifier.fit(scaled_scores,self.training_labels)
-        return self.classifier,roc,results
-    
+        self.classifier,auc = self.trainer.find_best_classifier()
+        return self.classifier,auc
+    @timer
     def predict(self):
         '''
         Use a fitted classifier to predict active/inactive probabilities for test set molecules
@@ -741,6 +766,8 @@ class PharmMapper:
         Returns:
         self.test_probs: array of shape (len(test_mols),2) containing class probabilities for each test compound
         '''
+        # align test conformers to the scaffold used to make consensus features
+        _ = align_conformers(self.test_mols,ref_mol=self.scaffold)
         # calculate volumetric overlap scores
         self.test_overlaps = self.calculate_score_matrix(self.test_mols)
         # scale scores, since Tversky scores can be >1
@@ -754,7 +781,7 @@ class PharmMapper:
         '''
         Make molecular fingerprints of all compounds
         '''
-        fpgen = AllChem.GetRDKitFPGenerator()
+        fpgen = AllChem.GetMorganGenerator()
         self.train_fps = [fpgen.GetFingerprint(x) for x in self.train_mols]
         self.test_fps = [fpgen.GetFingerprint(x) for x in self.test_mols]
 
@@ -768,7 +795,7 @@ class PharmMapper:
         Returns:
         max_scores: list of maximum Tanimoto similarities between each test compound and the training set
         '''
-        if not self.train_fps:
+        if not hasattr(self,'train_fps'):
             self.__make_fps()
         self.train_test_sim = np.zeros(len(self.test_fps))
         for i in range(len(self.test_fps)):
@@ -823,50 +850,75 @@ class Trainer:
     '''
     Class to handle classifier model selection and training
     '''
+    svm = skl.svm.SVC(probability=True)
+    svm_params = {'C':np.logspace(-2,3,6,base=2)}
+    sgd = skl.linear_model.SGDClassifier(loss='modified_huber')
+    sgd_params = {'alpha':np.logspace(-5,0,6,base=10)}
+    k_neighbors = skl.neighbors.KNeighborsClassifier()
+    kn_params = {'leaf_size':np.linspace(10,100,10)}
+    hgbc = skl.ensemble.HistGradientBoostingClassifier()
+    hgbc_params = {'max_leaf_nodes':[11,21,31,41],'min_samples_leaf':[5,10,15,20,25,30]}
+    mlp = skl.neural_network.MLPClassifier()
+    mlp_params={'hidden_layer_sizes':[(10,),(25,),(50,),(100,),(250,),(500,)],'alpha':np.logspace(-6,-1,6,base=10)}
+    classifiers = [svm,sgd,k_neighbors,hgbc,mlp]
+    all_params = [svm_params,sgd_params,kn_params,hgbc_params,mlp_params]
+
     def __init__(self,train_data,train_labels):
         self.X = train_data
         self.y = train_labels
-        
-    def find_best_classifier(self):
-        '''
-        Try a range of classifier models and select the one with best ROC-AUC, using default parameters
-        Args: none
-        Returns:
-        best_classifier: unfitted classifier model of type that hda best cross-validation performance
-        self.roc_aucs[best_i]: mean ROC-AUC of best performing model in cross-validation
-        classifier_opt_results: list of dicts containing cross-validation outputs, potentially useful for downstream analysis
-        '''
-        self.svm = skl.svm.SVC(probability=True)
-        self.sgd = skl.linear_model.SGDClassifier(loss='modified_huber')
-        self.k_neighbors = skl.neighbors.KNeighborsClassifier()
-        self.hgbc = skl.ensemble.HistGradientBoostingClassifier()
-        self.kernel_approx = skl.kernel_approximation.Nystroem()
-        self.kernel_sgd = skl.linear_model.SGDClassifier(loss='modified_huber')
-        self.classifiers = [self.svm,self.sgd,self.k_neighbors,self.hgbc]
-        self.classifier_opt_results = []
-        self.roc_aucs = []
-        for c in self.classifiers:
-            results = skl.model_selection.cross_validate(c,self.X,self.y,scoring='roc_auc',
-                                                         return_estimator=True,return_indices=True)
-            r_array = results['test_score']
-            r = np.mean(r_array)
-            self.roc_aucs.append(r)
-            self.classifier_opt_results.append(results)
-        self.classifiers.append(self.kernel_sgd)
-        results_kernel = skl.model_selection.cross_validate(self.kernel_sgd,self.X,self.y,scoring='roc_auc',
-                                                           return_estimator=True,return_indices=True)
-        self.roc_aucs.append(np.mean(results_kernel['test_score']))
-        self.classifier_opt_results.append(results_kernel)
-        best_i = np.argmax(self.roc_aucs)
-        best_classifier = self.classifiers[best_i]
-        self.model = best_classifier
-        return best_classifier,self.roc_aucs[best_i],self.classifier_opt_results  
     
     def parameter_sweep(self,classifier,param_grid):
         '''
         Perform cross-validated parameter sweep on a classifier to optimize hyperparameters
         '''
-        pass
+        scoring = {'AUC':'roc_auc','Precision':'precision','Recall':'recall'}
+        g = skl.model_selection.GridSearchCV(classifier,param_grid,scoring=scoring,refit='AUC',return_train_score=True)
+        g.fit(self.X,self.y)
+        return g.best_estimator_,g.best_score_,g.best_params_,g
+    
+    def train_all_classifiers(self,save_params=True):
+        self.trained_models=[]
+        self.best_scores = []
+        if save_params:
+            self.best_params=[]
+            self.param_testers=[]
+        for i in range(len(self.classifiers)):
+            model,score,params,g = self.parameter_sweep(self.classifiers[i],self.all_params[i])
+            self.trained_models.append(model)
+            self.best_scores.append(score)
+            if save_params:
+                self.best_params.append(params)
+                self.param_testers.append(g)
+
+    def find_best_classifier(self):
+        '''
+        Try a range of classifier models and select the one with best ROC-AUC, using default parameters
+        Args: none
+        Returns:
+        best_classifier: fitted classifier model of type that had best cross-validation performance
+        self.best_scores[best_i]: mean cross-validation score of best trained model
+        '''
+        # self.classifier_opt_results = []
+        # self.roc_aucs = []
+        # for c in self.classifiers:
+        #     results = skl.model_selection.cross_validate(c,self.X,self.y,scoring='roc_auc',
+        #                                                  return_estimator=True,return_indices=True)
+        #     r_array = results['test_score']
+        #     r = np.mean(r_array)
+        #     self.roc_aucs.append(r)
+        #     self.classifier_opt_results.append(results)
+        # best_i = np.argmax(self.roc_aucs)
+        # best_classifier = self.classifiers[best_i]
+        # self.model = best_classifier
+        self.train_all_classifiers(save_params=True)
+        best_i = np.argmax(self.best_scores)
+        self.best_classifier=self.trained_models[best_i]
+        return self.best_classifier,self.best_scores[best_i]
+
+    
+
+
+    
     
 
 ### Things below this point are likely not useful
