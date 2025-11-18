@@ -43,7 +43,7 @@ def timer(func):
 
         execution_time = end_time - start_time
 
-        print(f"{func.__name__} executed in {execution_time:.4f} seconds")
+        print(f"{func.__name__} executed in {execution_time:.4f} seconds",flush=True)
 
         return result
 
@@ -249,10 +249,10 @@ def align_conformers(mols,ref_mol=None):
 
 def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=None):
     '''
-    Cluster pharmacophore features, either by hierarchical or k-means clustering
+    Cluster pharmacophore features
     Args:
     feats: pd.DataFrame of ph4 features to cluster. column names should include 'Family', 'x', 'y', 'z'
-    clust_method: clustering method to use ('hierarchical' or 'k-means')
+    clust_method: clustering method to use ('hdbscan', 'hierarchical', or 'k-means')
     max_n: maximum number of clusters to consider in screen
     random_state: seed for randomization, used for k-means clustering
     Returns:
@@ -275,6 +275,23 @@ def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=Non
         elif clust_method=='k_means':
             opt_clusts,best_n,max_silhouette,silhouettes = optimal_kmeans(pos_matrix, min_k=2, max_k=max_n,
                                                                           random_state=random_state)
+        elif clust_method=='hdbscan':
+            clusterer = skl.cluster.HDBSCAN(min_cluster_size=max([5,len(group)/max_n]))
+            opt_clusts= clusterer.fit_predict(pos_matrix)
+            max_silhouette = skl.metrics.silhouette_score(pos_matrix,opt_clusts)
+            silhouettes = [max_silhouette]
+            best_n=None
+        elif clust_method=='gaussian':
+            clusterer = skl.mixture.BayesianGaussianMixture(n_components=max_n,covariance_type='spherical',
+                                                            random_state=random_state,max_iter=2000,
+                                                            init_params='k-means++')
+            opt_clusts = clusterer.fit_predict(pos_matrix)
+            if len(np.unique(opt_clusts))>1:
+                max_silhouette = skl.metrics.silhouette_score(pos_matrix,opt_clusts)
+            else:
+                max_silhouette=None
+            silhouettes=[max_silhouette]
+            best_n=len(np.unique(opt_clusts))
         # assign cluster IDs to features
         group['Cluster'] = opt_clusts
         if len(clustered_feats)==0:
@@ -527,7 +544,7 @@ class PharmMapper:
             else:
                 # skip unpacking if molecule already has single conformer
                 new_train_mols.append(m)
-        if self.test_mols:
+        if self.test_mols is not None:
             for m in self.test_mols:
                 if len(m.GetConformers())>1:
                     if rep_only:
@@ -718,7 +735,8 @@ class PharmMapper:
     @timer
     def make_consensus_ph4(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,
               method='hierarchical',max_n_hits=50,max_n_decoys=50,
-              sim_cutoff=0.75,dr=1.08265,random_state=None):
+              sim_cutoff=0.75,dr=1.08265,random_state=None,
+              verbose=False):
         '''
         Perform consensus feature identification pipeline
         Args:
@@ -732,15 +750,21 @@ class PharmMapper:
         random_state: seed for randomization
         Returns: none
         '''
+        if verbose:
+            print("Preparing conformers",flush=True)
         self.prepare_mols(unpack=unpack,dist_thresh=dist_thresh,potency_thresh=potency_thresh,
                                   rep_only=rep_only)
+        if verbose:
+            print("Generating consensus training features",flush=True)
         self.generate_training_features(clust_method=method,max_n_hits=max_n_hits,
                                         max_n_decoys=max_n_decoys,random_state=random_state,dr=dr)
+        if verbose:
+            print("Finding overlapping active/inactive features",flush=True)
         self.__find_structural_features(sim_cutoff=sim_cutoff)
         self.__assign_scoring_weights()
         self.all_feats = pd.concat([self.consensus_hits,self.consensus_decoys])
     @timer
-    def make_classifier(self):
+    def make_classifier(self,mlp=False,verbose=False):
         '''
         Find the best-performing classifier from a variety of algorithms, and return that fitted classifier
         Args:none
@@ -749,17 +773,23 @@ class PharmMapper:
         roc: mean ROC-AUC of best-performing classifier, from cross-validation
         results: list of dicts containing cross-validation results, potentially useful for downstream plotting
         '''
+        if verbose:
+            print("Calculating training set overlap scores",flush=True)
         self.training_scores = self.calculate_score_matrix(self.hits+self.decoys)
         self.training_labels = [1]*len(self.hits)+[0]*len(self.decoys)
         # scale scores, since Tversky scores can be >1
+        if verbose:
+            print("Scaling scores",flush=True)
         scaler = skl.preprocessing.StandardScaler()
         scaled_scores = scaler.fit_transform(self.training_scores)
         # make Trainer, run cross-validation on range of classifiers and get best one
-        self.trainer = Trainer(scaled_scores,self.training_labels)
+        if verbose:
+            print("Training and cross-validating classifiers",flush=True)
+        self.trainer = Trainer(scaled_scores,self.training_labels,do_mlp=mlp)
         self.classifier,auc = self.trainer.find_best_classifier()
         return self.classifier,auc
     @timer
-    def predict(self):
+    def predict(self,verbose=False):
         '''
         Use a fitted classifier to predict active/inactive probabilities for test set molecules
         Args: none
@@ -767,13 +797,21 @@ class PharmMapper:
         self.test_probs: array of shape (len(test_mols),2) containing class probabilities for each test compound
         '''
         # align test conformers to the scaffold used to make consensus features
+        if verbose:
+            print("Aligning conformers",flush=True)
         _ = align_conformers(self.test_mols,ref_mol=self.scaffold)
         # calculate volumetric overlap scores
+        if verbose:
+            print("Scoring test set",flush=True)
         self.test_overlaps = self.calculate_score_matrix(self.test_mols)
         # scale scores, since Tversky scores can be >1
+        if verbose:
+            print("Scaling test set scores",flush=True)
         scaler = skl.preprocessing.StandardScaler()
         scaled_scores = scaler.fit_transform(self.test_overlaps)
         # predict class probabilities using pre-trained classifier
+        if verbose:
+            print("Predicting test set classes",flush=True)
         self.test_probs = self.classifier.predict_proba(scaled_scores)
         return self.test_probs
 
@@ -858,14 +896,17 @@ class Trainer:
     kn_params = {'leaf_size':np.linspace(10,100,10)}
     hgbc = skl.ensemble.HistGradientBoostingClassifier()
     hgbc_params = {'max_leaf_nodes':[11,21,31,41],'min_samples_leaf':[5,10,15,20,25,30]}
-    mlp = skl.neural_network.MLPClassifier()
-    mlp_params={'hidden_layer_sizes':[(10,),(25,),(50,),(100,),(250,),(500,)],'alpha':np.logspace(-6,-1,6,base=10)}
-    classifiers = [svm,sgd,k_neighbors,hgbc,mlp]
-    all_params = [svm_params,sgd_params,kn_params,hgbc_params,mlp_params]
+    classifiers = [svm,sgd,k_neighbors,hgbc]
+    all_params = [svm_params,sgd_params,kn_params,hgbc_params]
 
-    def __init__(self,train_data,train_labels):
+    def __init__(self,train_data,train_labels,do_mlp=True):
         self.X = train_data
         self.y = train_labels
+        if do_mlp:
+            self.mlp = skl.neural_network.MLPClassifier()
+            self.mlp_params={'hidden_layer_sizes':[(10,),(25,),(50,),(100,),(250,),(500,)],'alpha':np.logspace(-6,-1,6,base=10)}
+            self.classifiers.append(self.mlp)
+            self.all_params.append(self.mlp_params)
     
     def parameter_sweep(self,classifier,param_grid):
         '''

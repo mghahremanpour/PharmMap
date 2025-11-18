@@ -7,7 +7,7 @@ features:
 consensus:
   dist_thresh: 1.5
   rep_only: True
-  clust_method: 'hierarchical'
-  max_hit_feats: 50
-  max_decoy_feats: 50
+  clust_method: 'gaussian'
+  max_hit_feats: 100
+  max_decoy_feats: 100
   sim_cutoff: 0.75
