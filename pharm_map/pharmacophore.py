@@ -215,7 +215,7 @@ def align_conformers(mols,ref_mol=None):
     Canonicalize all conformers of input molecules and align them
     Args:
     mols: iterable of rdMol objects
-    ref_mol: reference molecule to align to. will use first molecule if none provided
+    ref_mol: reference molecule to align to. will use first molecule in mols if none provided
     Returns:
     RMSDs: list of RMSD values for optimal alignments. lower indicates better alignment
     scores: list of scores produced by O3A for optimal alignments. higher indicates better alignment
@@ -247,14 +247,20 @@ def align_conformers(mols,ref_mol=None):
         RMSDs.append(mol_RMSDs)
     return RMSDs,scores
 
-def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=None):
+def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=None,verbose=False):
     '''
     Cluster pharmacophore features
     Args:
     feats: pd.DataFrame of ph4 features to cluster. column names should include 'Family', 'x', 'y', 'z'
-    clust_method: clustering method to use ('hdbscan', 'hierarchical', or 'k-means')
+    clust_method: clustering method to use ('gaussian', 'hdbscan', 'hierarchical', or 'k-means')
+        'gaussian' uses Bayesian inference to fit a Gaussian mixture model. this is theoretically the preferred option.
+        other options use the specified clustering algorithm as implemented in scikit-learn. 'hdbscan' should be faster
+        than 'hierarchical' and 'k-means' since it only needs to run once rather than testing a range of parameters
     max_n: maximum number of clusters to consider in screen
-    random_state: seed for randomization, used for k-means clustering
+        for clust_method='gaussian', this is the maximum number of components in the mixture model. note that
+        the model can choose to weight fewer components, so treat this as an upper bound
+    random_state: seed for randomization, used for k-means clustering and GMM fitting
+    verbose: whether to print progress messages
     Returns:
     clustered_feats: pd.DataFrame of features with cluster IDs added
     clust_qc: tuple of (best_n,max_silhouette,silhouettes) returned by optimal clustering functions'''
@@ -263,6 +269,8 @@ def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=Non
     # only want to cluster feats within each feature type
     feats_by_fam = feats.groupby('Family')
     for fam, group in feats_by_fam:
+        if verbose:
+            print(f"Clustering {fam}",flush=True)
         pos_matrix = group[['x','y','z']].to_numpy()
         # reduce max_n if there aren't enough features to cluster
         if max_n>np.shape(pos_matrix)[0]-1:
@@ -285,13 +293,14 @@ def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=Non
             clusterer = skl.mixture.BayesianGaussianMixture(n_components=max_n,covariance_type='spherical',
                                                             random_state=random_state,max_iter=2000,
                                                             init_params='k-means++')
+            # using spherical covariance, since consensus features will later be modelled as spherical Gaussians
             opt_clusts = clusterer.fit_predict(pos_matrix)
             if len(np.unique(opt_clusts))>1:
                 max_silhouette = skl.metrics.silhouette_score(pos_matrix,opt_clusts)
             else:
                 max_silhouette=None
             silhouettes=[max_silhouette]
-            best_n=len(np.unique(opt_clusts))
+            best_n=len(np.unique(opt_clusts)) # number of components that had features assigned to them, which may be less than max_n
         # assign cluster IDs to features
         group['Cluster'] = opt_clusts
         if len(clustered_feats)==0:
@@ -340,13 +349,13 @@ def compute_feature_centroid_sigma(feats,default_radius=1.08265):
     consensus_feats = pd.concat(consensus_feats).reset_index(drop=True)
     return consensus_feats
 
-def cluster_by_fingerprint(mols,fp_method='RDKit',all_confs=False,
+def cluster_by_fingerprint(mols,fp_method='morgan',all_confs=False,
                         clust_method='k_means',max_k=10,random_state=None):
     '''
     Cluster rdMol objects based on molecular fingerprints
     Args:
     mols: list of rdMol objects to be clustered
-    fp_method: fingerprint generation method to use
+    fp_method: fingerprint generation method to use. usually you will want fp_method='morgan'
     all_confs: if True, cluster each conformer of input molecules separately. only works if fp_method=='atom_pair'
     clust_method: clustering method to use ('k_means' only for now, 'hierarchical' should be supported eventually)
     max_k: maximum number of clusters to attempt
@@ -358,6 +367,7 @@ def cluster_by_fingerprint(mols,fp_method='RDKit',all_confs=False,
     largest_clust: ID of largest cluster
     clust_qc: QC metrics returned by optimal clustering function
     '''
+    # get fingerprint generator
     if fp_method == 'RDKit':
         fpgen = AllChem.GetRDKitFPGenerator()
     elif fp_method == 'atom_pair':
@@ -381,6 +391,7 @@ def cluster_by_fingerprint(mols,fp_method='RDKit',all_confs=False,
         clusts, best_k, min_silhouette, silhouettes = optimal_kmeans(umap_fit,max_k=max_k,
                                                                     random_state=random_state)
         clust_qc = (best_k,min_silhouette,silhouettes)
+    ##TODO: implement additional clustering methods
     
     # make dict of molecules by cluster
     clust_dict={}
@@ -484,11 +495,14 @@ class PharmMapper:
     ff=ChemicalFeatures.BuildFeatureFactory(ff_path)
     hits=[]
     decoys=[]
+    scaffold=None
+    all_feats=None
+    classifier=None
 
     def __init__(self,train_mols,test_mols=None,feature_factory=None,potency_key='IC50'):
         self.train_mols=train_mols
         self.test_mols = test_mols
-        if feature_factory:
+        if feature_factory: #overwrite default feature factory if a different one was provided
             self.ff = feature_factory
         self.potkey = potency_key
         
@@ -504,7 +518,6 @@ class PharmMapper:
         with open(filename,'rb') as file:
             ph4_dict = pickle.load(file)
         mapper = cls(ph4_dict['train_mols'],ph4_dict['test_mols'],
-                     feature_factory=ph4_dict['feature_factory'],
                      potency_key=ph4_dict['potkey'])
         if 'all_feats' in ph4_dict.keys():
             mapper.all_feats=ph4_dict['all_feats']
@@ -575,6 +588,7 @@ class PharmMapper:
                 self.hits.append(m)
             else:
                 self.decoys.append(m)
+
     @timer
     def prepare_mols(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True):
         '''
@@ -585,15 +599,20 @@ class PharmMapper:
         rep_only: whether to return only representative conformers or all conformers
         Returns: none
         '''
+        # unpack conformers if required
         if unpack:
             self.train_mols,self.test_mols = self.__unpack_conformers(rep_only=rep_only,dist_thresh=dist_thresh)
+        # align all training set conformers
         RMSDs,scores = align_conformers(self.train_mols)
+        # split training set into actives and inactives
         self.__split_actives_inactives(thresh=potency_thresh)
+        # save scaffold molecule for later alignment of test set
         self.scaffold = self.train_mols[0]
 
     @timer
     def generate_training_features(self,clust_method='hierarchical',max_n_hits=10,
-                                   max_n_decoys=30,dr=1.08265,random_state=None):
+                                   max_n_decoys=30,dr=1.08265,random_state=None,
+                                   verbose=False):
         '''
         Extract consensus ph4 features from identified hits and decoys
         Args:
@@ -601,16 +620,27 @@ class PharmMapper:
         max_n_hits: maximum number of clusters to attempt when clustering features from hits
         max_n_decoys: maximum number of clusters to attempt when clustering features from decoys
         random_state: seed for randomization
+        verbose: whether to print progress messages
         Returns: none
         '''
+        if verbose:
+            print("Extracting active ph4 features",flush=True)
         allhits = extract_features(self.hits,self.ff)
+        if verbose:
+            print("Extracting inactive ph4 features",flush=True)
         alldecoys = extract_features(self.decoys,self.ff)
+        if verbose:
+            print("Clustering active features",flush=True)
         hit_clusts,_ = cluster_features(allhits,clust_method=clust_method,
-                                        max_n=max_n_hits,random_state=random_state)
+                                        max_n=max_n_hits,random_state=random_state,
+                                        verbose=verbose)
         self.consensus_hits = compute_feature_centroid_sigma(hit_clusts,default_radius=dr)
         self.consensus_hits['Class']=['active']*len(self.consensus_hits)
+        if verbose:
+            print("Clustering inactive features",flush=True)
         decoy_clusts,_ = cluster_features(alldecoys,clust_method=clust_method,
-                                          max_n=max_n_decoys,random_state=random_state)
+                                          max_n=max_n_decoys,random_state=random_state,
+                                          verbose=verbose)
         self.consensus_decoys = compute_feature_centroid_sigma(decoy_clusts,default_radius=dr)
         self.consensus_decoys['Class']=['inactive']*len(self.consensus_decoys)
 
@@ -748,6 +778,7 @@ class PharmMapper:
         max_n_decoys: maximum number of clusters to attempt when clustering features from decoys
         sim_cutoff: similarity cutoff above which two features will be considered matched
         random_state: seed for randomization
+        verbose: whether to print progress messages
         Returns: none
         '''
         if verbose:
@@ -755,9 +786,12 @@ class PharmMapper:
         self.prepare_mols(unpack=unpack,dist_thresh=dist_thresh,potency_thresh=potency_thresh,
                                   rep_only=rep_only)
         if verbose:
+            print(f"{len(self.hits)} active conformers in training set")
+            print(f"{len(self.decoys)} inactive conformers in training set")
             print("Generating consensus training features",flush=True)
         self.generate_training_features(clust_method=method,max_n_hits=max_n_hits,
-                                        max_n_decoys=max_n_decoys,random_state=random_state,dr=dr)
+                                        max_n_decoys=max_n_decoys,random_state=random_state,dr=dr,
+                                        verbose=verbose)
         if verbose:
             print("Finding overlapping active/inactive features",flush=True)
         self.__find_structural_features(sim_cutoff=sim_cutoff)
@@ -856,16 +890,16 @@ class PharmMapper:
         Returns: none
         '''
         ph4_dict = {}
-        if self.scaffold:
+        if self.scaffold is not None:
             ph4_dict['scaffold']=self.scaffold
-        if self.all_feats:
+        if self.all_feats is not None:
             ph4_dict['all_feats']=self.all_feats
-        if self.classifier:
+        if self.classifier is not None:
             ph4_dict['classifier']=self.classifier
-        if self.hits:
+        if len(self.hits)>0:
             ph4_dict['hits']=self.hits
+        if len(self.decoys)>0:
             ph4_dict['decoys']=self.decoys
-        ph4_dict['ff']=self.feature_factory
         ph4_dict['potkey']=self.potkey
         ph4_dict['train_mols']=self.train_mols
         ph4_dict['test_mols']=self.test_mols
@@ -890,16 +924,16 @@ class Trainer:
     '''
     svm = skl.svm.SVC(probability=True)
     svm_params = {'C':np.logspace(-2,3,6,base=2)}
-    sgd = skl.linear_model.SGDClassifier(loss='modified_huber')
+    sgd = skl.linear_model.SGDClassifier(loss='modified_huber',max_iter=10000)
     sgd_params = {'alpha':np.logspace(-5,0,6,base=10)}
     k_neighbors = skl.neighbors.KNeighborsClassifier()
-    kn_params = {'leaf_size':np.linspace(10,100,10)}
+    kn_params = {'leaf_size':np.linspace(10,100,10).astype(int)}
     hgbc = skl.ensemble.HistGradientBoostingClassifier()
     hgbc_params = {'max_leaf_nodes':[11,21,31,41],'min_samples_leaf':[5,10,15,20,25,30]}
     classifiers = [svm,sgd,k_neighbors,hgbc]
     all_params = [svm_params,sgd_params,kn_params,hgbc_params]
 
-    def __init__(self,train_data,train_labels,do_mlp=True):
+    def __init__(self,train_data,train_labels,do_mlp=False):
         self.X = train_data
         self.y = train_labels
         if do_mlp:
@@ -908,30 +942,34 @@ class Trainer:
             self.classifiers.append(self.mlp)
             self.all_params.append(self.mlp_params)
     
-    def parameter_sweep(self,classifier,param_grid):
+    def parameter_sweep(self,classifier,param_grid,verbose=False):
         '''
         Perform cross-validated parameter sweep on a classifier to optimize hyperparameters
         '''
         scoring = {'AUC':'roc_auc','Precision':'precision','Recall':'recall'}
-        g = skl.model_selection.GridSearchCV(classifier,param_grid,scoring=scoring,refit='AUC',return_train_score=True)
+        if verbose:
+            gv = 3
+        else:
+            gv=0
+        g = skl.model_selection.GridSearchCV(classifier,param_grid,scoring=scoring,refit='AUC',return_train_score=True,verbose=gv)
         g.fit(self.X,self.y)
         return g.best_estimator_,g.best_score_,g.best_params_,g
     
-    def train_all_classifiers(self,save_params=True):
+    def train_all_classifiers(self,save_params=True,verbose=False):
         self.trained_models=[]
         self.best_scores = []
         if save_params:
             self.best_params=[]
             self.param_testers=[]
         for i in range(len(self.classifiers)):
-            model,score,params,g = self.parameter_sweep(self.classifiers[i],self.all_params[i])
+            model,score,params,g = self.parameter_sweep(self.classifiers[i],self.all_params[i],verbose=verbose)
             self.trained_models.append(model)
             self.best_scores.append(score)
             if save_params:
                 self.best_params.append(params)
                 self.param_testers.append(g)
 
-    def find_best_classifier(self):
+    def find_best_classifier(self,verbose=False):
         '''
         Try a range of classifier models and select the one with best ROC-AUC, using default parameters
         Args: none
@@ -951,7 +989,7 @@ class Trainer:
         # best_i = np.argmax(self.roc_aucs)
         # best_classifier = self.classifiers[best_i]
         # self.model = best_classifier
-        self.train_all_classifiers(save_params=True)
+        self.train_all_classifiers(save_params=True,verbose=verbose)
         best_i = np.argmax(self.best_scores)
         self.best_classifier=self.trained_models[best_i]
         return self.best_classifier,self.best_scores[best_i]

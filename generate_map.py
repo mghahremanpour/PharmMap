@@ -53,7 +53,8 @@ mapper.make_consensus_ph4(unpack=args.no_unpack,dist_thresh=params['consensus'][
                             max_n_decoys=params['consensus']['max_decoy_feats'],
                             sim_cutoff=params['consensus']['sim_cutoff'],
                             dr=params['features']['default_radius'],
-                            random_state=params['random_seed'])
+                            random_state=params['random_seed'],
+                            verbose=args.verbose)
 
 # Save consensus mapper
 outfile = args.outdir+args.output+'_mapper_featsonly.pkl'

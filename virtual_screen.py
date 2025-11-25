@@ -88,7 +88,7 @@ if args.train:
     # Train several classifier models and get the best one to use for prediction
     if args.verbose:
         print("Training optimal classifier...",flush=True)
-    classifier,roc,results=mapper.make_classifier(mlp=args.mlp,verbose=args.verbose)
+    classifier,roc=mapper.make_classifier(mlp=args.mlp,verbose=args.verbose)
         
 elif args.m:
     # Reload a pretrained mapper from pickle if provided
