@@ -90,12 +90,16 @@ if args.train:
         print("Training optimal classifier...",flush=True)
     classifier,roc=mapper.make_classifier(mlp=args.mlp,verbose=args.verbose)
         
-elif args.m:
+elif args.mapper:
     # Reload a pretrained mapper from pickle if provided
     if args.verbose:
         print("Loading mapper from pickle...",flush=True)
-    mapper = ph4.PharmMapper.from_pickle(args.m)
+    mapper = ph4.PharmMapper.from_pickle(args.mapper)
     mapper.test_mols=tm
+    if mapper.classifier is None:
+        if args.verbose:
+            print("Training optimal classifier...",flush=True)
+        classifier,roc=mapper.make_classifier(mlp=args.mlp,verbose=args.verbose)
     if args.sim:
         # If desired, calculate maximum similarities between test compounds and training set
         if args.verbose:
@@ -124,10 +128,7 @@ results_df['ID']=[m.GetProp('_Name') for m in results_df['Conformer']]
 results_df.sort_values('P(active)',ascending=False,inplace=True)
 outfile = args.outdir+args.output+'_results.sdf'
 PandasTools.WriteSDF(results_df,outfile,molColName='Conformer',properties=['ID','SMILES','P(active)','P(inactive)'])
-outfile2 = args.outdir+args.output+'_results.csv'
-similarity_df = pd.read_csv(args.confidence) 
-results_df['Confidence'] = [float(similarity_df['max_similarity'].loc[similarity_df['ID']==results_df['ID'].iloc[i]]) for i in range(len(results_df))]
-results_df.to_csv(outfile2,columns=['ID','SMILES','P(active)','P(inactive)','Confidence'])
+
 
 # Save mapper if desired
 if args.sm:
@@ -143,6 +144,11 @@ if args.sc:
     classifier_file = args.outdir+args.output+'_classifiers.pkl'
     with open(classifier_file,'wb') as file:
         pickle.dump(mapper.trainer.trained_models,file)
+
+outfile2 = args.outdir+args.output+'_results.csv'
+similarity_df = pd.read_csv(args.confidence) 
+results_df['Confidence'] = [float(similarity_df['max_similarity'].loc[similarity_df['ID']==results_df['ID'].iloc[i]]) for i in range(len(results_df))]
+results_df.to_csv(outfile2,columns=['ID','SMILES','P(active)','P(inactive)','Confidence'])
 
 if args.verbose:
     print("Done!",flush=True)

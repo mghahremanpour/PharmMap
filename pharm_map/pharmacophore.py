@@ -498,6 +498,7 @@ class PharmMapper:
     scaffold=None
     all_feats=None
     classifier=None
+    scaler=None
 
     def __init__(self,train_mols,test_mols=None,feature_factory=None,potency_key='IC50'):
         self.train_mols=train_mols
@@ -523,14 +524,18 @@ class PharmMapper:
             mapper.all_feats=ph4_dict['all_feats']
             mapper.consensus_hits=mapper.all_feats.loc[mapper.all_feats['Class']=='active']
             mapper.consensus_decoys=mapper.all_feats.loc[mapper.all_feats['Class']=='inactive']
+        if 'hits' in ph4_dict.keys():
+            mapper.hits = ph4_dict['hits']
+        if 'decoys' in ph4_dict.keys():
+            mapper.decoys = ph4_dict['decoys']
         if 'scaffold' in ph4_dict.keys():
             mapper.scaffold=ph4_dict['scaffold']
         if 'classifier' in ph4_dict.keys():
             mapper.classifier=ph4_dict['classifier']
+        if 'scaler' in ph4_dict.keys():
+            mapper.scaler = ph4_dict['scaler']
         return mapper
             
-            
-    
     def __unpack_conformers(self,rep_only=True,dist_thresh=1.5):
         '''
         Unpack rdMol objects with multiple conformers into new rdMol objects with one conformer each
@@ -814,8 +819,8 @@ class PharmMapper:
         # scale scores, since Tversky scores can be >1
         if verbose:
             print("Scaling scores",flush=True)
-        scaler = skl.preprocessing.StandardScaler()
-        scaled_scores = scaler.fit_transform(self.training_scores)
+        self.scaler = skl.preprocessing.StandardScaler()
+        scaled_scores = self.scaler.fit_transform(self.training_scores)
         # make Trainer, run cross-validation on range of classifiers and get best one
         if verbose:
             print("Training and cross-validating classifiers",flush=True)
@@ -841,8 +846,7 @@ class PharmMapper:
         # scale scores, since Tversky scores can be >1
         if verbose:
             print("Scaling test set scores",flush=True)
-        scaler = skl.preprocessing.StandardScaler()
-        scaled_scores = scaler.fit_transform(self.test_overlaps)
+        scaled_scores = self.scaler.fit_transform(self.test_overlaps)
         # predict class probabilities using pre-trained classifier
         if verbose:
             print("Predicting test set classes",flush=True)
@@ -896,6 +900,8 @@ class PharmMapper:
             ph4_dict['all_feats']=self.all_feats
         if self.classifier is not None:
             ph4_dict['classifier']=self.classifier
+        if self.scaler is not None:
+            ph4_dict['scaler']=self.scaler
         if len(self.hits)>0:
             ph4_dict['hits']=self.hits
         if len(self.decoys)>0:
@@ -946,12 +952,12 @@ class Trainer:
         '''
         Perform cross-validated parameter sweep on a classifier to optimize hyperparameters
         '''
-        scoring = {'AUC':'roc_auc','Precision':'precision','Recall':'recall'}
+        scoring = {'AUC':'roc_auc','Precision':'precision','Recall':'recall','Balanced':'balanced_accuracy'}
         if verbose:
             gv = 3
         else:
             gv=0
-        g = skl.model_selection.GridSearchCV(classifier,param_grid,scoring=scoring,refit='AUC',return_train_score=True,verbose=gv)
+        g = skl.model_selection.GridSearchCV(classifier,param_grid,scoring=scoring,refit='Balanced',return_train_score=True,verbose=gv)
         g.fit(self.X,self.y)
         return g.best_estimator_,g.best_score_,g.best_params_,g
     
@@ -963,7 +969,7 @@ class Trainer:
             self.param_testers=[]
         for i in range(len(self.classifiers)):
             model,score,params,g = self.parameter_sweep(self.classifiers[i],self.all_params[i],verbose=verbose)
-            self.trained_models.append(model)
+            self.trained_models.append(g)
             self.best_scores.append(score)
             if save_params:
                 self.best_params.append(params)
