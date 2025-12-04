@@ -536,7 +536,7 @@ class PharmMapper:
             mapper.scaler = ph4_dict['scaler']
         return mapper
             
-    def __unpack_conformers(self,rep_only=True,dist_thresh=1.5):
+    def __unpack_conformers(self,do='train',rep_only=True,dist_thresh=1.5):
         '''
         Unpack rdMol objects with multiple conformers into new rdMol objects with one conformer each
         Args:
@@ -545,42 +545,40 @@ class PharmMapper:
         Returns:
         new_mols: list of rdMol objects with one conformer each
         '''
-        new_train_mols=[]
-        new_test_mols=[]
-        for m in self.train_mols:
-            if len(m.GetConformers())>1:
-                if rep_only:
-                    # extract representative conformers if desired
-                    _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
-                                                                    make_mols=True)
-                    new_train_mols = new_train_mols + mols_to_use
+        new_mols = []
+        if do == 'train':
+            for m in self.train_mols:
+                if len(m.GetConformers())>1:
+                    if rep_only:
+                        # extract representative conformers if desired
+                        _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
+                                                                        make_mols=True)
+                        new_mols = new_mols + mols_to_use
+                    else:
+                        # unpack all conformers into new rdMol objects
+                        for c in m.GetConformers():
+                            nm=Chem.Mol(m,confId=c.GetId())
+                            new_mols.append(nm)
                 else:
-                    # unpack all conformers into new rdMol objects
-                    for c in m.GetConformers():
-                        nm=Chem.Mol(m,confId=c.GetId())
-                        new_train_mols.append(nm)
-            else:
-                # skip unpacking if molecule already has single conformer
-                new_train_mols.append(m)
-        if self.test_mols is not None:
+                    # skip unpacking if molecule already has single conformer
+                    new_mols.append(m)
+        elif do == 'test':
             for m in self.test_mols:
                 if len(m.GetConformers())>1:
                     if rep_only:
                         # extract representative conformers if desired
                         _,_,mols_to_use = get_representative_conformers(m,thresh=dist_thresh,
                                                                         make_mols=True)
-                        new_test_mols = new_train_mols + mols_to_use
+                        new_mols = new_mols + mols_to_use
                     else:
                         # unpack all conformers into new rdMol objects
                         for c in m.GetConformers():
                             nm=Chem.Mol(m,confId=c.GetId())
-                            new_test_mols.append(nm)
+                            new_mols.append(nm)
                 else:
                     # skip unpacking if molecule already has single conformer
-                    new_test_mols.append(m)
-        else:
-            new_test_mols=None
-        return new_train_mols,new_test_mols
+                    new_mols.append(m)
+        return new_mols
 
     def __split_actives_inactives(self,thresh=0.1):
         '''
@@ -595,7 +593,7 @@ class PharmMapper:
                 self.decoys.append(m)
 
     @timer
-    def prepare_mols(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True):
+    def prepare_mols(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,confs='all'):
         '''
         Unpack and align molecules to prepare them for consensus feature identification
         Args:
@@ -606,22 +604,29 @@ class PharmMapper:
         '''
         # unpack conformers if required
         if unpack:
-            self.train_mols,self.test_mols = self.__unpack_conformers(rep_only=rep_only,dist_thresh=dist_thresh)
+            self.train_mols = self.__unpack_conformers(do='train',rep_only=rep_only,dist_thresh=dist_thresh)
         # align all training set conformers
         RMSDs,scores = align_conformers(self.train_mols)
+        # filter down to only best-aligned conformers, if desired
+        if confs == 'best':
+            df = pd.DataFrame({'Molecule':self.train_mols,'SMILES':[Chem.MolToSmiles(m) for m in self.train_mols],
+                               'RMSD':RMSDs})
+            df.sort_values('RMSD',ascending=True,inplace=True)
+            best_confs = df.groupby('SMILES',sort=False).head(1)
+            self.train_mols = best_confs['Molecule']
         # split training set into actives and inactives
         self.__split_actives_inactives(thresh=potency_thresh)
         # save scaffold molecule for later alignment of test set
         self.scaffold = self.train_mols[0]
 
     @timer
-    def generate_training_features(self,clust_method='hierarchical',max_n_hits=10,
+    def generate_training_features(self,clust_method='gaussian',max_n_hits=10,
                                    max_n_decoys=30,dr=1.08265,random_state=None,
                                    verbose=False):
         '''
         Extract consensus ph4 features from identified hits and decoys
         Args:
-        clust_method: clustering method to use ('hierarchical' or 'k_means')
+        clust_method: clustering method to use ['gaussian' / 'hierarchical' / 'k_means' / 'hdbscan']
         max_n_hits: maximum number of clusters to attempt when clustering features from hits
         max_n_decoys: maximum number of clusters to attempt when clustering features from decoys
         random_state: seed for randomization
@@ -770,7 +775,7 @@ class PharmMapper:
     @timer
     def make_consensus_ph4(self,unpack=True,dist_thresh=1.5,potency_thresh=0.1,rep_only=True,
               method='hierarchical',max_n_hits=50,max_n_decoys=50,
-              sim_cutoff=0.75,dr=1.08265,random_state=None,
+              sim_cutoff=0.75,dr=1.08265,random_state=None,confs='all',
               verbose=False):
         '''
         Perform consensus feature identification pipeline
@@ -789,7 +794,7 @@ class PharmMapper:
         if verbose:
             print("Preparing conformers",flush=True)
         self.prepare_mols(unpack=unpack,dist_thresh=dist_thresh,potency_thresh=potency_thresh,
-                                  rep_only=rep_only)
+                                  rep_only=rep_only,confs=confs)
         if verbose:
             print(f"{len(self.hits)} active conformers in training set")
             print(f"{len(self.decoys)} inactive conformers in training set")
@@ -828,7 +833,7 @@ class PharmMapper:
         self.classifier,auc = self.trainer.find_best_classifier()
         return self.classifier,auc
     @timer
-    def predict(self,verbose=False):
+    def predict(self,unpack=True,rep_only=True,dist_thresh=1.5,verbose=False,confs='all'):
         '''
         Use a fitted classifier to predict active/inactive probabilities for test set molecules
         Args: none
@@ -838,7 +843,17 @@ class PharmMapper:
         # align test conformers to the scaffold used to make consensus features
         if verbose:
             print("Aligning conformers",flush=True)
+        self.test_mols = self.__unpack_conformers(do='test',rep_only=rep_only,dist_thresh=dist_thresh)
         _ = align_conformers(self.test_mols,ref_mol=self.scaffold)
+        # filter out only best-aligned conformer for each test set molecule, if desired
+        if confs == 'best':
+            if verbose:
+                print("Selecting best-aligned conformers",flush=True)
+            df = pd.DataFrame({'Molecule':self.test_mols,'SMILES':[Chem.MolToSmiles(m) for m in self.test_mols],
+                               'RMSD':RMSDs})
+            df.sort_values('RMSD',ascending=True,inplace=True)
+            best_confs = df.groupby('SMILES',sort=False).head(1)
+            self.test_mols = best_confs['Molecule']
         # calculate volumetric overlap scores
         if verbose:
             print("Scoring test set",flush=True)
