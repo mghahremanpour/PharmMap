@@ -155,7 +155,7 @@ final_df = pd.concat(all_results,ignore_index=True)
 
 # save results
 outfile = args.outdir+args.output+'_results.sdf'
-PandasTools.WriteSDF(results_df,outfile,molColName='Conformer',properties=['ID','SMILES','P(active)','P(inactive)'])
+PandasTools.WriteSDF(results_df,outfile,molColName='Conformer',properties=['ID','SMILES','Potency','P(active)','P(inactive)'])
 
 if args.verbose:
     print("Done!",flush=True)
