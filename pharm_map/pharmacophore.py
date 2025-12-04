@@ -918,12 +918,12 @@ class PharmMapper:
         if self.scaler is not None:
             ph4_dict['scaler']=self.scaler
         if len(self.hits)>0:
-            ph4_dict['hits']=self.hits
+            ph4_dict['hits']=[Chem.PropertyMol(m) for m in self.hits]
         if len(self.decoys)>0:
-            ph4_dict['decoys']=self.decoys
+            ph4_dict['decoys']=[Chem.PropertyMol(m) for m in self.decoys]
         ph4_dict['potkey']=self.potkey
-        ph4_dict['train_mols']=self.train_mols
-        ph4_dict['test_mols']=self.test_mols
+        ph4_dict['train_mols']=[Chem.PropertyMol(m) for m in self.train_mols]
+        ph4_dict['test_mols']=[Chem.PropertyMol(m) for m in self.test_mols]
         with open(filename,'wb') as file:
             pickle.dump(ph4_dict,file)
         
