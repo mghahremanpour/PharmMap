@@ -28,6 +28,7 @@ parser.add_argument('--outdir',default='./',help='Directory to save outputs')
 parser.add_argument('-u','--no-unpack',action='store_false',help=
                     'Do not unpack conformers. Only pass this if you know all mols in molfile have exactly one conformer each and you want to keep exactly those conformers')
 parser.add_argument('--sim', action='store_true', help='Calculate test-train similarity scores')
+parser.add_argument('--test-confs',default='all',help='Which conformers from test set to screen ["all" / "best"]')
 parser.add_argument('--sm','--save-mapper', action='store_true', help='Save ph4 mapper information to pickle')
 parser.add_argument('--sc','--save-classifiers',action='store_true',help='Save all classifier options rather than just the best one')
 parser.add_argument('-c','--confidence',default='confidence.csv',help='Path to file containing confidence information for each test compound ID')
@@ -116,7 +117,8 @@ else:
 # Run inactive/active predictions on test set compounds (class 0 is inactive, class 1 is active)
 if args.verbose:
     print("Predicting test set class probabilities...",flush=True)
-test_probs = mapper.predict(verbose=args.verbose)
+test_probs = mapper.predict(confs=args.test_confs,unpack=args.no_unpack,
+                            dist_thresh=params['consensus']['dist_thresh'],verbose=args.verbose)
     
 
 # Save results
@@ -145,8 +147,9 @@ if args.sc:
     with open(classifier_file,'wb') as file:
         pickle.dump(mapper.trainer.trained_models,file)
 
+#TODO: make the confidence section below work, and figure out what a good confidence metric is
 outfile2 = args.outdir+args.output+'_results.csv'
-similarity_df = pd.read_csv(args.confidence) 
+similarity_df = pd.read_csv(args.confidence,header=0) 
 results_df['Confidence'] = [float(similarity_df['max_similarity'].loc[similarity_df['ID']==results_df['ID'].iloc[i]]) for i in range(len(results_df))]
 results_df.to_csv(outfile2,columns=['ID','SMILES','P(active)','P(inactive)','Confidence'])
 
