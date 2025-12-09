@@ -301,6 +301,7 @@ def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=Non
             silhouettes = [max_silhouette]
             best_n=None
         elif clust_method=='gaussian':
+            #TODO: make covariance type for this and gaussian_twostage user-specifiable
             clusterer = skl.mixture.BayesianGaussianMixture(n_components=max_n,covariance_type='spherical',
                                                             random_state=random_state,max_iter=2000,
                                                             init_params='k-means++')
@@ -612,6 +613,7 @@ class PharmMapper:
         Args:
         thresh: cutoff value for potency metric (values less than thresh are active, greater are inactive)
         Returns: none'''
+        #TODO: if user doesn't specify a threshold, use e.g. histogram analysis to determine one
         for m in self.train_mols:
             if m.GetDoubleProp(self.potkey)<=thresh:
                 self.hits.append(m)
@@ -846,6 +848,16 @@ class PharmMapper:
         if verbose:
             print("Calculating training set overlap scores",flush=True)
         self.training_scores = self.calculate_score_matrix(self.hits+self.decoys)
+        '''
+        Possible future addition: use scikit-learn predict_proba on fitted GMM to make scores
+        Problem: number of features would be compound-dependent, so how to transform to constant number of features?
+        for each consensus feature, take the highest probability among sample features and use that? sum of probabilities?
+        This would probably require two-stage GMM fitting to avoid extraneous components with zero weight hanging around
+        Also needs to retain the actual GMM object, not just the DataFrame of information, so edit make_consensus_ph4
+        Shared active/inactive feature distinctions would potentially be difficult, since they would live in separate skl objects
+        Make new GMM from means + variances of identified features after shared detection? using weights_init,means_init,precisions_init
+            would still have to call fit() though, so not sure this works
+        '''
         self.training_labels = [1]*len(self.hits)+[0]*len(self.decoys)
         # scale scores, since Tversky scores can be >1
         if verbose:

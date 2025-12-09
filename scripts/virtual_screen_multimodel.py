@@ -124,6 +124,9 @@ elif args.mapper:
             simfile = args.outdir+args.output+'_test_train_similarities.csv'
             np.savetxt(simfile,sims,delimiter=',')
         mappers.append(mapper)
+else:
+    # Error out if no method to train a mapper was provided
+    raise ValueError("Need a mapper to screen with - must pass either -t or -m")
 
 # save mappers
 if args.sm:

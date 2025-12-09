@@ -147,6 +147,7 @@ if args.sc:
     with open(classifier_file,'wb') as file:
         pickle.dump(mapper.trainer.trained_models,file)
 
+#TODO: make the confidence section below work, and figure out what a good confidence metric is
 outfile2 = args.outdir+args.output+'_results.csv'
 similarity_df = pd.read_csv(args.confidence,header=0) 
 results_df['Confidence'] = [float(similarity_df['max_similarity'].loc[similarity_df['ID']==results_df['ID'].iloc[i]]) for i in range(len(results_df))]
