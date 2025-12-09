@@ -54,13 +54,13 @@ with Chem.ForwardSDMolSupplier(test_supp) as suppl:
 if args.train:
     # Load training set molecules and add explicit Hs (important for alignment,etc.)
     if args.verbose:
-        print("Loading training set molecules to train new mapper...",flush=True)
+        print("Loading training set molecules to train new mappers...",flush=True)
     train_supp = gzip.open(args.train)
     with Chem.ForwardSDMolSupplier(train_supp) as suppl:
         train_mols=[Chem.AddHs(m) for m in suppl if m is not None]
     # Get conformers of best active, to use to train mappers
-    mol_df = pd.DataFrame('Molecule':train_mols,'SMILES':[Chem.MolToSmiles(m) for m in train_mols],
-                          'Potency'=[m.GetDoubleProp(args.potency) for m in train_mols])
+    mol_df = pd.DataFrame({'Molecule':train_mols,'SMILES':[Chem.MolToSmiles(m) for m in train_mols],
+                          'Potency':[m.GetDoubleProp(args.potency) for m in train_mols]})
     mol_df.sort_values('Potency',ascending=True,inplace=True)
     grouped = mol_df.groupby('SMILES')
     scaffolds = grouped.get_group(mol_df['SMILES'].iloc[0])

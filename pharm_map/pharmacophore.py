@@ -24,29 +24,17 @@ import time
 
 DrawingOptions.includeAtomNumbers=True
 def timer(func):
-
     """
-
     This decorator reports the execution time 
-
     of a function.
-
     """
-
     def wrapper(*args, **kwargs):
-
         start_time = time.perf_counter()
-
         result     = func(*args, **kwargs)
-
         end_time   = time.perf_counter()
-
         execution_time = end_time - start_time
-
         print(f"{func.__name__} executed in {execution_time:.4f} seconds",flush=True)
-
         return result
-
     return wrapper
 
 def optimal_kmeans(data,min_k=2,max_k=10,random_state=None):
@@ -109,21 +97,44 @@ def optimal_hierarchical_clustering(data,min_nclust,max_nclust):
     return opt_clusts, best_n, max_silhouette, silhouettes
 
 def confs_from_smiles(smiles,num_embed=100,align=True,random_seed=-1):
+    '''
+    Generate a specified number of confomers for a molecule from a SMILES string
+    Args:
+    smiles: SMILES string of interest
+    num_embed: number of conformers to generate
+    align: whether to align all conformers to the first one generated
+    random_seed: seed for randomization
+    Returns:
+    mol: rdMol object containing all generated conformers
+    '''
     mol = Chem.MolFromSmiles(smiles)
-    mol = Chem.AddHs(mol)
-    confs = AllChem.EmbedMultipleConfs(mol,numConfs=num_embed,randomSeed=random_seed)
-    optimize_res = AllChem.MMFFOptimizeMoleculeConfs(mol)
-    AllChem.AlignMolConformers(mol)
+    mol = Chem.AddHs(mol) # add explicit hydrogens for geometry optimization
+    confs = AllChem.EmbedMultipleConfs(mol,numConfs=num_embed,randomSeed=random_seed) # generate conformers
+    optimize_res = AllChem.MMFFOptimizeMoleculeConfs(mol) # minimize conformer energy
+    if align:
+        AllChem.AlignMolConformers(mol) # align conformers if desired
     return mol
 
 def generate_LE_conformers(mols,embed_count=100,random_seed=-1,save=False,filename=None):
+    '''
+    Generate low-energy conformers for a series of molecules
+    Args:
+    mols: list-like of rdMol objects to make conformers for
+    embed_count: number of conformers to generate before selecting lowest-energy conformer
+    random_seed: seed for randomization
+    save: whether to save conformers to a pickle
+    filename: file to save conformers to, if desired
+    Returns:
+    out_mols: list of rdMol objects with one low-energy conformer each
+    '''
     out_mols = []
     for mol in mols:
+        # embed many conformations to select low-energy conformer from
         confs = AllChem.EmbedMultipleConfs(mol,numConfs=embed_count,
                                             randomSeed=random_seed)
-        res=AllChem.MMFFOptimizeMoleculeConfs(mol)
-        LE_conf_ID = res.index(min(res,key=lambda t: t[1]))
-        out_mol = Chem.Mol(mol,confId=LE_conf_ID)
+        res=AllChem.MMFFOptimizeMoleculeConfs(mol) # minimize conformer energies
+        LE_conf_ID = res.index(min(res,key=lambda t: t[1])) # select lowest-energy conformer
+        out_mol = Chem.Mol(mol,confId=LE_conf_ID) # make new rdMol with just the lowest-energy conformer
         out_mols.append(out_mol)
     if save:
         if filename:
@@ -301,6 +312,21 @@ def cluster_features(feats,clust_method='hierarchical',max_n=10,random_state=Non
                 max_silhouette=None
             silhouettes=[max_silhouette]
             best_n=len(np.unique(opt_clusts)) # number of components that had features assigned to them, which may be less than max_n
+        elif clust_method=='gaussian_twostage':
+            clusterer = skl.mixture.BayesianGaussianMixture(n_components=max_n,covariance_type='spherical',
+                                                            random_state=random_state,max_iter=1000)
+            opt_clusts2 = clusterer.fit_predict(pos_matrix)
+            nclusts = len(np.unique(opt_clusts2)) # get the number of clusters the model actually used
+            # refit a mixture model with fixed number of components
+            clusterer2 = skl.mixture.GaussianMixture(n_components=nclusts,covariance_type='spherical',
+                                                     random_state=random_state,max_iter=1000)
+            opt_clusts = clusterer2.fit_predict(pos_matrix)
+            if len(np.unique(opt_clusts))>1:
+                max_silhouette = skl.metrics.silhouette_score(pos_matrix,opt_clusts)
+            else:
+                max_silhouette=None
+            silhouettes=[max_silhouette]
+            best_n=len(np.unique(opt_clusts))
         # assign cluster IDs to features
         group['Cluster'] = opt_clusts
         if len(clustered_feats)==0:
@@ -626,7 +652,7 @@ class PharmMapper:
         '''
         Extract consensus ph4 features from identified hits and decoys
         Args:
-        clust_method: clustering method to use ['gaussian' / 'hierarchical' / 'k_means' / 'hdbscan']
+        clust_method: clustering method to use ['gaussian' / 'gaussian_twostage' / 'hierarchical' / 'k_means' / 'hdbscan']
         max_n_hits: maximum number of clusters to attempt when clustering features from hits
         max_n_decoys: maximum number of clusters to attempt when clustering features from decoys
         random_state: seed for randomization
@@ -844,7 +870,7 @@ class PharmMapper:
         if verbose:
             print("Aligning conformers",flush=True)
         self.test_mols = self.__unpack_conformers(do='test',rep_only=rep_only,dist_thresh=dist_thresh)
-        _ = align_conformers(self.test_mols,ref_mol=self.scaffold)
+        RMSDs,scores = align_conformers(self.test_mols,ref_mol=self.scaffold)
         # filter out only best-aligned conformer for each test set molecule, if desired
         if confs == 'best':
             if verbose:
